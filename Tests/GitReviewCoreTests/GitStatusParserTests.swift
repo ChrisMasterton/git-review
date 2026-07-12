@@ -35,10 +35,23 @@ import Testing
     #expect(branches.count == 4)
     #expect(branches[0].behind == 1)
     #expect(branches[1].needsPush)
+    #expect(branches[1].canPublish)
+    #expect(branches[1].canCleanUpSafely)
     #expect(branches[2].ahead == 3)
+    #expect(branches[2].canPush)
     #expect(branches[3].upstreamGone)
     #expect(branches[3].needsPush)
+    #expect(branches[3].canCleanUpSafely)
     #expect(branches[3].lastCommitDate == Date(timeIntervalSince1970: 1_720_000_000))
+}
+
+@Test func localOnlyBranchOffersWaysToResolveAttention() {
+    let branch = BranchTrackingStatus(name: "feature/local", upstream: nil, ahead: 0, behind: 0)
+
+    #expect(branch.needsPush)
+    #expect(branch.canPublish)
+    #expect(branch.canCleanUpSafely)
+    #expect(!branch.canPush)
 }
 
 @Test func parsesLocalBranchActivityFromReflogs() {

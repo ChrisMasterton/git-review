@@ -13,3 +13,4 @@
 - Added a contextual toolbar Pull button when the selected branch is behind its fetched upstream.
 - Added last-commit, last-used, and reflog-backed approximate creation ages to branches needing attention.
 - Added compact per-branch Clean Up and Push actions beside actionable upstream status.
+- Fixed local-only branches showing “Needs push” without an action by adding safe Clean Up and Publish controls.

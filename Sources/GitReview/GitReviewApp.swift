@@ -403,8 +403,8 @@ enum CommitService {
 
 enum BranchActionService {
     static func deleteSafely(repository: RepositorySnapshot, branch: BranchTrackingStatus) throws -> String {
-        guard branch.upstreamGone else {
-            throw CommitFlowError.command("The upstream for \(branch.name) is not marked as gone.")
+        guard branch.canCleanUpSafely else {
+            throw CommitFlowError.command("\(branch.name) is not an unpublished or stale local branch.")
         }
         let result = GitCommand.run([
             "-C", repository.path.path,
@@ -421,10 +421,24 @@ enum BranchActionService {
     }
 
     static func push(repository: RepositorySnapshot, branch: BranchTrackingStatus) throws -> String {
-        guard branch.ahead > 0 else {
+        guard branch.canPublish || branch.canPush else {
             throw CommitFlowError.command("\(branch.name) has no commits waiting to be pushed.")
         }
         let prefix = ["-C", repository.path.path]
+        if branch.canPublish {
+            let origin = GitCommand.run(prefix + ["remote", "get-url", "origin"])
+            guard origin.exitCode == 0, !origin.output.isEmpty else {
+                throw CommitFlowError.command("No origin remote is configured for \(branch.name).")
+            }
+            let result = GitCommand.run(prefix + [
+                "push", "--set-upstream", "origin", branch.name
+            ])
+            guard result.exitCode == 0 else {
+                throw CommitFlowError.command(result.error.isEmpty ? "Git push failed for \(branch.name)." : result.error)
+            }
+            return "Published \(branch.name) to origin/\(branch.name)"
+        }
+
         let remoteResult = GitCommand.run(prefix + ["config", "--get", "branch.\(branch.name).remote"])
         let mergeResult = GitCommand.run(prefix + ["config", "--get", "branch.\(branch.name).merge"])
         guard remoteResult.exitCode == 0, !remoteResult.output.isEmpty,
@@ -1597,30 +1611,35 @@ struct BranchSection: View {
                             if branch.behind > 0 { Text("\(branch.behind) behind").font(.caption).foregroundStyle(.secondary) }
                             if store.isBranchActionInProgress(repository: repository, branch: branch) {
                                 ProgressView().controlSize(.small).frame(width: 62)
-                            } else if branch.upstreamGone {
-                                Button(role: .destructive) {
-                                    store.cleanupBranch(repository: repository, branch: branch)
-                                } label: {
-                                    Label("Clean Up", systemImage: "trash")
+                            } else {
+                                if branch.canPublish || branch.canPush {
+                                    Button {
+                                        store.pushBranch(repository: repository, branch: branch)
+                                    } label: {
+                                        Label(branch.canPublish ? "Publish" : "Push", systemImage: "arrow.up")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .buttonBorderShape(.capsule)
+                                    .controlSize(.small)
+                                    .tint(.blue)
+                                    .disabled(store.isRefreshing || store.isCleaningBranches)
+                                    .help(branch.canPublish
+                                        ? "Publish \(branch.name) to origin and configure its upstream"
+                                        : "Push \(branch.name) to its configured upstream")
                                 }
-                                .buttonStyle(.bordered)
-                                .buttonBorderShape(.capsule)
-                                .controlSize(.small)
-                                .tint(.orange)
-                                .disabled(store.isRefreshing || store.isCleaningBranches)
-                                .help("Safely delete this local branch; unmerged or checked-out branches are preserved")
-                            } else if branch.ahead > 0 {
-                                Button {
-                                    store.pushBranch(repository: repository, branch: branch)
-                                } label: {
-                                    Label("Push", systemImage: "arrow.up")
+                                if branch.canCleanUpSafely {
+                                    Button(role: .destructive) {
+                                        store.cleanupBranch(repository: repository, branch: branch)
+                                    } label: {
+                                        Label("Clean Up", systemImage: "trash")
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .buttonBorderShape(.capsule)
+                                    .controlSize(.small)
+                                    .tint(.orange)
+                                    .disabled(store.isRefreshing || store.isCleaningBranches)
+                                    .help("Safely delete this local branch; unmerged or checked-out branches are preserved")
                                 }
-                                .buttonStyle(.bordered)
-                                .buttonBorderShape(.capsule)
-                                .controlSize(.small)
-                                .tint(.blue)
-                                .disabled(store.isRefreshing || store.isCleaningBranches)
-                                .help("Push \(branch.name) to its configured upstream")
                             }
                         }
                         BranchActivitySummary(branch: branch)

@@ -133,7 +133,10 @@ public struct BranchTrackingStatus: Equatable, Sendable {
         self.approximateCreatedDate = approximateCreatedDate
     }
 
-    public var needsPush: Bool { upstreamGone || (upstream == nil && !isPublishedWithoutUpstream) || ahead > 0 }
+    public var canPublish: Bool { upstream == nil && !isPublishedWithoutUpstream && !upstreamGone }
+    public var canPush: Bool { upstream != nil && !upstreamGone && ahead > 0 }
+    public var canCleanUpSafely: Bool { upstreamGone || canPublish }
+    public var needsPush: Bool { upstreamGone || canPublish || ahead > 0 }
 }
 
 public enum BranchTrackingParser {
