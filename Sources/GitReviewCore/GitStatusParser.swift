@@ -48,6 +48,16 @@ public struct ParsedGitStatus: Equatable, Sendable {
 }
 
 public enum GitStatusParser {
+    /// Drops the `[ahead N]`, `[behind N]`, or `[gone]` suffix from a short-status
+    /// branch header line. Remote ref updates from a background fetch change these
+    /// values without touching the working tree, so commit fingerprints use this
+    /// form to avoid false "changed since generation" failures.
+    public static func removingTrackingSummary(from line: String) -> String {
+        guard line.hasPrefix("##") else { return line }
+        guard let range = line.range(of: " [") else { return line }
+        return String(line[..<range.lowerBound])
+    }
+
     public static func parse(_ output: String) -> ParsedGitStatus {
         var result = ParsedGitStatus()
 

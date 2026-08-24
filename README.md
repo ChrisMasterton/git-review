@@ -10,7 +10,7 @@ It follows the same lightweight SwiftUI approach as Container Review: no third-p
 - Commits ahead of the configured upstream on every local branch, not only the checked-out branch.
 - Local branches without an upstream, unless their tip is already present on a remote branch.
 - Branch activity context: reliable last-commit age, local reflog-derived last-used age, and an approximate creation age when the original branch-creation reflog entry still exists.
-- Commits behind the current branch's upstream.
+- Commits behind the current branch's upstream. Repositories whose current branch is behind count as needing attention with a "Behind remote" label.
 - Remote fetch failures, shown without hiding the local status result.
 - One-click cleanup for unpublished local branches and branches whose upstream is gone. Cleanup uses Git's safe delete and skips checked-out or unmerged branches rather than force-deleting work.
 - An assisted commit flow that generates an editable commit message from the selected repository's pending status and tracked diffs, then stages and commits all changes after confirmation.
@@ -27,7 +27,7 @@ The Commit button first asks for permission to send data. Git Review redacts com
 
 Push publishes existing commits from the current branch without staging or committing working-tree changes. It uses the existing branch remote when configured and creates an `origin` upstream for a new local branch. A local-only branch listed under Branches Needing Attention can also be published directly without checking it out. Pull is available only for clean working trees and runs with `--ff-only`, so it never creates an implicit merge commit.
 
-Large generated dependency folders such as `node_modules`, `.build`, `DerivedData`, and `vendor` are skipped during discovery. Nested repositories elsewhere are still found.
+Large generated dependency folders such as `node_modules`, `.build`, and `DerivedData` are skipped during discovery without inspection. Generically named folders such as `bin`, `dist`, `obj`, `vendor`, `Build`, `Library`, or `Temp` are skipped only when neither the folder itself nor its direct children contain a repository, so real projects that happen to use those names are still found. Nested repositories elsewhere are always discovered.
 
 ## Run from source
 
@@ -64,7 +64,7 @@ Create a release zip and SHA-256 file:
 
 ## Privacy
 
-Outside the explicitly confirmed OpenRouter commit-message flow, Git Review is local-only. It reads folder paths selected by you and shells out to the local Git CLI for discovery metadata, status, branch tracking, log summary, and remote fetch. Git Review never pushes. Branch deletion and commit actions run only after confirmation.
+Outside the explicitly confirmed OpenRouter commit-message flow, Git Review is local-only. Git runs with interactive prompts disabled; a custom `GIT_SSH_COMMAND` or `GIT_SSH` from your environment is respected rather than replaced. It reads folder paths selected by you and shells out to the local Git CLI for discovery metadata, status, branch tracking, log summary, and remote fetch. Git Review never pushes. Branch deletion and commit actions run only after confirmation.
 
 ## License
 

@@ -1,5 +1,16 @@
 # Release Notes
 
+## 0.2.0
+
+- Fixed a possible permanent hang when a Git command wrote more than a pipe buffer of output; subprocess output now goes through temporary files and every Git command has an overall timeout, with remote fetches allowed up to ten minutes.
+- Tightened the assisted commit flow: after staging, the working tree is verified again, and any change that appeared while staging aborts the commit instead of committing unverified edits.
+- Commit change-set fingerprints now ignore ahead/behind/gone tracking summaries, so a background remote refresh no longer invalidates a message being reviewed.
+- Fixed garbled non-ASCII filenames by disabling Git path quoting for status and diff output.
+- Improved repository discovery: generically named folders such as `bin`, `dist`, `obj`, `vendor`, `Build`, `Library`, or `Temp` are skipped only when neither the folder itself nor its direct children contain a repository, while dependency folders such as `node_modules` remain always skipped.
+- Repositories whose current branch is behind its upstream now count as needing attention with a "Behind remote" label and an inline branch hint.
+- Capped untracked-file fingerprinting at the file size plus the first and last 512 KiB so large untracked artifacts cannot slow commit-message generation.
+- A custom `GIT_SSH_COMMAND` or `GIT_SSH` and HTTP low-speed settings from the environment are now respected instead of replaced; interactive Git prompts remain disabled.
+
 ## 0.1.0
 
 - Added recursive monitoring for one or more local workspace folders.

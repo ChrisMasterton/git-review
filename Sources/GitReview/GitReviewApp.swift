@@ -39,15 +39,16 @@ struct RepositorySnapshot: Identifiable, Equatable, Sendable {
     var currentBranchTracking: BranchTrackingStatus? { branches.first { $0.name == branch } }
     var currentBranchNeedsPush: Bool { currentBranchTracking?.needsPush == true || ahead > 0 }
     var needsAttention: Bool {
-        statusError != nil || !changes.isEmpty || !unpublishedBranches.isEmpty
+        statusError != nil || !changes.isEmpty || !unpublishedBranches.isEmpty || behind > 0
     }
     var isClean: Bool { !needsAttention }
     var riskRank: Int {
-        if statusError != nil { return 5 }
-        if conflictCount > 0 { return 4 }
-        if !changes.isEmpty && !unpublishedBranches.isEmpty { return 3 }
-        if !changes.isEmpty { return 2 }
-        if !unpublishedBranches.isEmpty { return 1 }
+        if statusError != nil { return 6 }
+        if conflictCount > 0 { return 5 }
+        if !changes.isEmpty && !unpublishedBranches.isEmpty { return 4 }
+        if !changes.isEmpty { return 3 }
+        if !unpublishedBranches.isEmpty { return 2 }
+        if behind > 0 { return 1 }
         return 0
     }
     var statusLabel: String {
@@ -56,6 +57,7 @@ struct RepositorySnapshot: Identifiable, Equatable, Sendable {
         if !changes.isEmpty && !unpublishedBranches.isEmpty { return "Local work + push" }
         if !changes.isEmpty { return "Uncommitted" }
         if !unpublishedBranches.isEmpty { return "Needs push" }
+        if behind > 0 { return "Behind remote" }
         return "Up to date"
     }
 }
@@ -104,37 +106,80 @@ enum GitCommand {
         return "git"
     }()
 
-    static func run(_ arguments: [String]) -> CommandResult {
+    /// Runs Git and waits with an overall timeout. Output goes to temporary
+    /// files instead of pipes, so a child writing more than a pipe buffer of
+    /// stderr can never block forever, and the caller never hangs on a stuck
+    /// remote or hook.
+    static func run(_ arguments: [String], timeout: TimeInterval = 120) -> CommandResult {
         let process = Process()
         process.executableURL = executable.hasPrefix("/")
             ? URL(fileURLWithPath: executable)
             : URL(fileURLWithPath: "/usr/bin/env")
         process.arguments = executable.hasPrefix("/") ? arguments : [executable] + arguments
         var environment = ProcessInfo.processInfo.environment
+        // Interactive prompts must stay off for background scans.
         environment["GIT_TERMINAL_PROMPT"] = "0"
-        environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=8"
-        environment["GIT_HTTP_LOW_SPEED_LIMIT"] = "1"
-        environment["GIT_HTTP_LOW_SPEED_TIME"] = "10"
+        // Everything else is a default only, so custom SSH setups keep working.
+        if environment["GIT_SSH_COMMAND"] == nil && environment["GIT_SSH"] == nil {
+            environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=8"
+        }
+        if environment["GIT_HTTP_LOW_SPEED_LIMIT"] == nil {
+            environment["GIT_HTTP_LOW_SPEED_LIMIT"] = "1"
+        }
+        if environment["GIT_HTTP_LOW_SPEED_TIME"] == nil {
+            environment["GIT_HTTP_LOW_SPEED_TIME"] = "10"
+        }
         process.environment = environment
 
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardOutput = stdout
-        process.standardError = stderr
+        let fileManager = FileManager.default
+        let scratchDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("git-review-\(UUID().uuidString)", isDirectory: true)
+        let stdoutURL = scratchDirectory.appendingPathComponent("stdout")
+        let stderrURL = scratchDirectory.appendingPathComponent("stderr")
+
+        do {
+            try fileManager.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
+            fileManager.createFile(atPath: stdoutURL.path, contents: nil)
+            fileManager.createFile(atPath: stderrURL.path, contents: nil)
+            process.standardOutput = try FileHandle(forWritingTo: stdoutURL)
+            process.standardError = try FileHandle(forWritingTo: stderrURL)
+        } catch {
+            try? fileManager.removeItem(at: scratchDirectory)
+            return CommandResult(output: "", error: error.localizedDescription, exitCode: -1)
+        }
+        defer { try? fileManager.removeItem(at: scratchDirectory) }
+
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
 
         do {
             try process.run()
-            let output = String(data: stdout.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            let error = String(data: stderr.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            process.waitUntilExit()
-            return CommandResult(
-                output: output.trimmingCharacters(in: .whitespacesAndNewlines),
-                error: error.trimmingCharacters(in: .whitespacesAndNewlines),
-                exitCode: process.terminationStatus
-            )
         } catch {
             return CommandResult(output: "", error: error.localizedDescription, exitCode: -1)
         }
+
+        var timedOut = false
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            timedOut = true
+            process.terminate()
+            if exited.wait(timeout: .now() + 5) == .timedOut {
+                kill(process.processIdentifier, SIGKILL)
+                _ = exited.wait(timeout: .now() + 5)
+            }
+        }
+        process.waitUntilExit()
+
+        let output = (try? String(contentsOf: stdoutURL, encoding: .utf8)) ?? ""
+        var error = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
+        if timedOut {
+            let note = "Git command exceeded its \(Int(timeout)) second limit and was stopped."
+            error = error.isEmpty ? note : error + "\n" + note
+        }
+        return CommandResult(
+            output: output.trimmingCharacters(in: .whitespacesAndNewlines),
+            error: error.trimmingCharacters(in: .whitespacesAndNewlines),
+            exitCode: process.terminationStatus
+        )
     }
 }
 
@@ -155,6 +200,7 @@ enum CommitFlowError: LocalizedError {
     case noAPIKey
     case noChanges
     case changedSinceGeneration
+    case changedWhileStaging
     case command(String)
     case invalidResponse(String)
 
@@ -166,6 +212,8 @@ enum CommitFlowError: LocalizedError {
             return "No pending changes were found to commit."
         case .changedSinceGeneration:
             return "The repository changed after the commit message was generated. Nothing was staged or committed. Refresh and generate a new message."
+        case .changedWhileStaging:
+            return "The repository changed while Git Review was staging files, so the commit was aborted rather than commit unverified edits. Nothing was committed; review the staged changes before committing manually."
         case let .command(detail), let .invalidResponse(detail):
             return detail
         }
@@ -190,7 +238,7 @@ enum CommitService {
     }
 
     static func context(for repository: RepositorySnapshot) throws -> CommitContext {
-        let prefix = ["-C", repository.path.path]
+        let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
         let status = GitCommand.run(prefix + ["status", "--short", "--branch", "--untracked-files=all"])
         guard status.exitCode == 0 else {
             throw CommitFlowError.command(status.error.isEmpty ? "Unable to read Git status." : status.error)
@@ -202,9 +250,13 @@ enum CommitService {
         let unstaged = GitCommand.run(prefix + ["diff", "--no-ext-diff", "--unified=3", "--"])
         let untracked = GitCommand.run(prefix + ["ls-files", "--others", "--exclude-standard", "-z"])
 
+        let fingerprintStatusOutput = statusLines
+            .map { GitStatusParser.removingTrackingSummary(from: String($0)) }
+            .joined(separator: "\n")
+
         let rawContext = """
         GIT STATUS
-        \(status.output)
+        \(fingerprintStatusOutput)
 
         STAGED DIFF
         \(staged.output)
@@ -294,11 +346,25 @@ enum CommitService {
             throw CommitFlowError.invalidResponse("Enter a commit message before committing.")
         }
 
-        let prefix = ["-C", repository.path.path]
+        let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
         let add = GitCommand.run(prefix + ["add", "--all", "--"])
         guard add.exitCode == 0 else {
             throw CommitFlowError.command(add.error.isEmpty ? "Unable to stage repository changes." : add.error)
         }
+
+        // After staging, nothing may remain unstaged or untracked. Any leftover
+        // worktree-side entry means the repository changed between generating
+        // the message and staging it, so refuse to commit unverified content.
+        let residual = GitCommand.run(prefix + ["status", "--porcelain", "--untracked-files=all"])
+        guard residual.exitCode == 0 else {
+            throw CommitFlowError.command(residual.error.isEmpty ? "Unable to verify staged changes." : residual.error)
+        }
+        let hasUnstagedRemainder = residual.output.split(separator: "\n").contains { line in
+            guard line.count > 1 else { return false }
+            return line[line.index(after: line.startIndex)] != " "
+        }
+        guard !hasUnstagedRemainder else { throw CommitFlowError.changedWhileStaging }
+
         let commit = GitCommand.run(prefix + ["commit", "--message", trimmedMessage])
         guard commit.exitCode == 0 else {
             throw CommitFlowError.command(commit.error.isEmpty ? "Git commit failed." : commit.error)
@@ -307,7 +373,7 @@ enum CommitService {
     }
 
     static func pull(repository: RepositorySnapshot) throws -> String {
-        let prefix = ["-C", repository.path.path]
+        let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
         let status = GitCommand.run(prefix + ["status", "--porcelain", "--untracked-files=all"])
         guard status.exitCode == 0 else {
             throw CommitFlowError.command(status.error.isEmpty ? "Unable to check the working tree before pulling." : status.error)
@@ -386,18 +452,43 @@ enum CommitService {
         }.joined(separator: "\n")
     }
 
+    /// Caps how much of an untracked file is hashed. Huge untracked artifacts
+    /// must not slow message generation, while the file size plus both ends
+    /// still detect appends, truncation, and edits near either end of the file.
+    private static let fingerprintedFileSpan = 512 * 1024
+
     private static func fileFingerprint(_ url: URL) -> String {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        let fileSize = (attributes?[.size] as? NSNumber)?.int64Value ?? -1
         guard let handle = try? FileHandle(forReadingFrom: url) else { return "unreadable" }
         defer { try? handle.close() }
         var hasher = SHA256()
+        hasher.update(data: Data("\(fileSize)".utf8))
         do {
-            while let data = try handle.read(upToCount: 1_048_576), !data.isEmpty {
-                hasher.update(data: data)
+            if fileSize < 0 || fileSize <= Int64(fingerprintedFileSpan) {
+                while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
+                    hasher.update(data: chunk)
+                }
+            } else {
+                hasher.update(data: try readExactly(handle, bytes: fingerprintedFileSpan))
+                hasher.update(data: Data("...\n".utf8))
+                try handle.seek(toOffset: UInt64(fileSize - Int64(fingerprintedFileSpan)))
+                hasher.update(data: try readExactly(handle, bytes: fingerprintedFileSpan))
             }
             return hasher.finalize().map { String(format: "%02x", $0) }.joined()
         } catch {
             return "read-error"
         }
+    }
+
+    private static func readExactly(_ handle: FileHandle, bytes: Int) throws -> Data {
+        var collected = Data()
+        collected.reserveCapacity(bytes)
+        while collected.count < bytes,
+              let chunk = try handle.read(upToCount: bytes - collected.count), !chunk.isEmpty {
+            collected.append(chunk)
+        }
+        return collected
     }
 }
 
@@ -458,10 +549,20 @@ enum BranchActionService {
 }
 
 enum RepositoryScanner {
-    private static let skippedDirectoryNames: Set<String> = [
-        ".git", ".build", ".cache", ".gradle", ".idea", ".next", ".nuxt",
-        ".swiftpm", ".terraform", ".venv", "Build", "DerivedData", "Library",
-        "Pods", "Temp", "bin", "coverage", "dist", "node_modules", "obj", "vendor"
+    /// Generated dependency folders that never contain user projects. These are
+    /// skipped everywhere without looking inside. Dot-prefixed folders need no
+    /// entry here because enumeration skips hidden files already.
+    private static let alwaysSkippedDirectoryNames: Set<String> = [
+        ".build", ".cache", ".gradle", ".idea", ".next", ".nuxt",
+        ".swiftpm", ".terraform", ".venv", "DerivedData", "Pods", "coverage",
+        "node_modules"
+    ]
+
+    /// Generic names that sometimes hold real projects. Skipped only when
+    /// neither the folder itself nor its direct children contain a repository,
+    /// so a checkout named `vendor` or a project at `vendor/service` is found.
+    private static let conditionallySkippedDirectoryNames: Set<String> = [
+        "Build", "Library", "Temp", "bin", "dist", "obj", "vendor"
     ]
 
     static func scan(roots: [URL], fetchRemotes: Bool) async -> [RepositorySnapshot] {
@@ -531,7 +632,6 @@ enum RepositoryScanner {
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
 
         for root in roots.map(\.standardizedFileURL) {
-            guard isGitRepository(root) || FileManager.default.fileExists(atPath: root.path) else { continue }
             if isGitRepository(root) { found[root.path] = (root, root) }
 
             guard let enumerator = FileManager.default.enumerator(
@@ -544,7 +644,13 @@ enum RepositoryScanner {
             for case let url as URL in enumerator {
                 let values = try? url.resourceValues(forKeys: Set(keys))
                 guard values?.isDirectory == true else { continue }
-                if values?.isSymbolicLink == true || skippedDirectoryNames.contains(url.lastPathComponent) {
+                if values?.isSymbolicLink == true {
+                    enumerator.skipDescendants()
+                    continue
+                }
+                let name = url.lastPathComponent
+                if alwaysSkippedDirectoryNames.contains(name)
+                    || (conditionallySkippedDirectoryNames.contains(name) && !containsNearbyRepository(url)) {
                     enumerator.skipDescendants()
                     continue
                 }
@@ -561,12 +667,25 @@ enum RepositoryScanner {
         FileManager.default.fileExists(atPath: url.appendingPathComponent(".git").path)
     }
 
+    /// One cheap directory level decides whether a generically named folder
+    /// might contain projects. Only a direct-child `.git` triggers a full
+    /// descent; everything else is skipped without walking the tree.
+    private static func containsNearbyRepository(_ directory: URL) -> Bool {
+        if isGitRepository(directory) { return true }
+        let children = (try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return children.contains { isGitRepository($0) }
+    }
+
     private static func inspect(_ path: URL, root: URL, fetchRemotes: Bool) -> RepositorySnapshot {
-        let prefix = ["-C", path.path]
+        let prefix = ["-C", path.path, "-c", "core.quotePath=false"]
         let remotes = GitCommand.run(prefix + ["remote"])
         var fetchError: String?
         if fetchRemotes, remotes.exitCode == 0, !remotes.output.isEmpty {
-            let fetch = GitCommand.run(prefix + ["fetch", "--all", "--prune", "--quiet"])
+            let fetch = GitCommand.run(prefix + ["fetch", "--all", "--prune", "--quiet"], timeout: 600)
             if fetch.exitCode != 0 { fetchError = fetch.error.isEmpty ? "Fetch failed" : fetch.error }
         }
 
@@ -1241,7 +1360,7 @@ struct RepositoryList: View {
                     ContentUnavailableView(
                         "Everything Is Accounted For",
                         systemImage: "checkmark.seal",
-                        description: Text("No uncommitted files or unpublished branches were found.")
+                        description: Text("No uncommitted files, unpublished branches, or branches behind their remote were found.")
                     )
                 } else {
                     ContentUnavailableView(
@@ -1594,7 +1713,15 @@ struct BranchSection: View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Branches Needing Attention").font(.headline)
             if repository.unpublishedBranches.isEmpty {
-                EmptyLine(symbol: "checkmark.circle", text: "All local branches are published", color: .green)
+                if repository.behind > 0 {
+                    EmptyLine(
+                        symbol: "arrow.down.circle",
+                        text: "Current branch is \(repository.behind) commit\(repository.behind == 1 ? "" : "s") behind \(repository.upstream ?? "upstream")",
+                        color: .orange
+                    )
+                } else {
+                    EmptyLine(symbol: "checkmark.circle", text: "All local branches are published", color: .green)
+                }
             } else {
                 ForEach(repository.unpublishedBranches, id: \.name) { branch in
                     VStack(alignment: .leading, spacing: 5) {

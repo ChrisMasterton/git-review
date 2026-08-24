@@ -54,6 +54,59 @@ import Testing
     #expect(!branch.canPush)
 }
 
+@Test func parsesRenameEntriesUsingTheNewPath() {
+    // Git lists the target path first, then the original path after a tab.
+    let status = GitStatusParser.parse(
+        "2 R. N... 100644 100644 100644 abc def R100 Sources/New Name.txt\tSources/Old Name.txt"
+    )
+
+    #expect(status.changes.count == 1)
+    #expect(status.changes[0].path == "Sources/New Name.txt")
+    #expect(status.changes[0].isStaged)
+    #expect(!status.changes[0].isConflicted)
+}
+
+@Test func parsesConflictedEntries() {
+    let status = GitStatusParser.parse(
+        "u UU N... 100644 100644 100644 100644 aaa bbb ccc f.txt"
+    )
+
+    #expect(status.changes.count == 1)
+    #expect(status.changes[0].path == "f.txt")
+    #expect(status.changes[0].isConflicted)
+    #expect(status.conflictCount == 1)
+}
+
+@Test func parsesDetachedHeadBranchLabel() {
+    let status = GitStatusParser.parse("# branch.head (detached)")
+
+    #expect(status.branch == "(detached)")
+}
+
+@Test func keepsUnicodePathsUnescapedWhenQuotePathIsDisabled() {
+    let status = GitStatusParser.parse("? файл с пробелом.txt")
+
+    #expect(status.changes.count == 1)
+    #expect(status.changes[0].path == "файл с пробелом.txt")
+    #expect(status.changes[0].isUntracked)
+}
+
+@Test func dropsTrackingSummaryFromShortStatusBranchLines() {
+    #expect(
+        GitStatusParser.removingTrackingSummary(from: "## main...origin/main [ahead 3, behind 2]")
+            == "## main...origin/main"
+    )
+    #expect(
+        GitStatusParser.removingTrackingSummary(from: "## feature/local [gone]")
+            == "## feature/local"
+    )
+    #expect(
+        GitStatusParser.removingTrackingSummary(from: "## main...origin/main")
+            == "## main...origin/main"
+    )
+    #expect(GitStatusParser.removingTrackingSummary(from: "?? notes.txt") == "?? notes.txt")
+}
+
 @Test func parsesLocalBranchActivityFromReflogs() {
     let output = """
     HEAD@{1730000000}\tcheckout: moving from main to feature/gone
