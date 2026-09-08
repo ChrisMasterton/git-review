@@ -3,65 +3,6 @@ import CryptoKit
 import GitReviewCore
 import SwiftUI
 
-struct RepositorySnapshot: Identifiable, Equatable, Sendable {
-    let path: URL
-    let workspaceRoot: URL
-    let branch: String
-    let upstream: String?
-    let ahead: Int
-    let behind: Int
-    let changes: [GitFileChange]
-    let branches: [BranchTrackingStatus]
-    let remoteURL: String?
-    let lastCommitHash: String?
-    let lastCommitAge: String?
-    let lastCommitSubject: String?
-    let fetchError: String?
-    let statusError: String?
-
-    var id: String { path.path }
-    var name: String { path.lastPathComponent }
-    var relativePath: String {
-        let rootPath = workspaceRoot.standardizedFileURL.path
-        let repoPath = path.standardizedFileURL.path
-        if repoPath == rootPath { return name }
-        let prefix = rootPath.hasSuffix("/") ? rootPath : rootPath + "/"
-        return repoPath.hasPrefix(prefix) ? String(repoPath.dropFirst(prefix.count)) : repoPath
-    }
-    var stagedCount: Int { changes.filter(\.isStaged).count }
-    var modifiedCount: Int { changes.filter(\.isModified).count }
-    var untrackedCount: Int { changes.filter(\.isUntracked).count }
-    var conflictCount: Int { changes.filter(\.isConflicted).count }
-    var workingTreeChangeCount: Int { changes.count }
-    var unpublishedBranches: [BranchTrackingStatus] { branches.filter(\.needsPush) }
-    var unpublishedCommitCount: Int { branches.reduce(0) { $0 + $1.ahead } }
-    var localOnlyBranchCount: Int { branches.filter { $0.upstream == nil }.count }
-    var currentBranchTracking: BranchTrackingStatus? { branches.first { $0.name == branch } }
-    var currentBranchNeedsPush: Bool { currentBranchTracking?.needsPush == true || ahead > 0 }
-    var needsAttention: Bool {
-        statusError != nil || !changes.isEmpty || !unpublishedBranches.isEmpty || behind > 0
-    }
-    var isClean: Bool { !needsAttention }
-    var riskRank: Int {
-        if statusError != nil { return 6 }
-        if conflictCount > 0 { return 5 }
-        if !changes.isEmpty && !unpublishedBranches.isEmpty { return 4 }
-        if !changes.isEmpty { return 3 }
-        if !unpublishedBranches.isEmpty { return 2 }
-        if behind > 0 { return 1 }
-        return 0
-    }
-    var statusLabel: String {
-        if statusError != nil { return "Git error" }
-        if conflictCount > 0 { return "Conflicts" }
-        if !changes.isEmpty && !unpublishedBranches.isEmpty { return "Local work + push" }
-        if !changes.isEmpty { return "Uncommitted" }
-        if !unpublishedBranches.isEmpty { return "Needs push" }
-        if behind > 0 { return "Behind remote" }
-        return "Up to date"
-    }
-}
-
 struct CommandResult: Sendable {
     let output: String
     let error: String
@@ -94,92 +35,6 @@ struct BranchCleanupResult: Sendable {
         }
         let remainder = failures.count - lines.count
         return (lines + (remainder > 0 ? ["…and \(remainder) more."] : [])).joined(separator: "\n")
-    }
-}
-
-enum GitCommand {
-    static let executable: String = {
-        for path in ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git"]
-        where FileManager.default.isExecutableFile(atPath: path) {
-            return path
-        }
-        return "git"
-    }()
-
-    /// Runs Git and waits with an overall timeout. Output goes to temporary
-    /// files instead of pipes, so a child writing more than a pipe buffer of
-    /// stderr can never block forever, and the caller never hangs on a stuck
-    /// remote or hook.
-    static func run(_ arguments: [String], timeout: TimeInterval = 120) -> CommandResult {
-        let process = Process()
-        process.executableURL = executable.hasPrefix("/")
-            ? URL(fileURLWithPath: executable)
-            : URL(fileURLWithPath: "/usr/bin/env")
-        process.arguments = executable.hasPrefix("/") ? arguments : [executable] + arguments
-        var environment = ProcessInfo.processInfo.environment
-        // Interactive prompts must stay off for background scans.
-        environment["GIT_TERMINAL_PROMPT"] = "0"
-        // Everything else is a default only, so custom SSH setups keep working.
-        if environment["GIT_SSH_COMMAND"] == nil && environment["GIT_SSH"] == nil {
-            environment["GIT_SSH_COMMAND"] = "ssh -o BatchMode=yes -o ConnectTimeout=8"
-        }
-        if environment["GIT_HTTP_LOW_SPEED_LIMIT"] == nil {
-            environment["GIT_HTTP_LOW_SPEED_LIMIT"] = "1"
-        }
-        if environment["GIT_HTTP_LOW_SPEED_TIME"] == nil {
-            environment["GIT_HTTP_LOW_SPEED_TIME"] = "10"
-        }
-        process.environment = environment
-
-        let fileManager = FileManager.default
-        let scratchDirectory = fileManager.temporaryDirectory
-            .appendingPathComponent("git-review-\(UUID().uuidString)", isDirectory: true)
-        let stdoutURL = scratchDirectory.appendingPathComponent("stdout")
-        let stderrURL = scratchDirectory.appendingPathComponent("stderr")
-
-        do {
-            try fileManager.createDirectory(at: scratchDirectory, withIntermediateDirectories: true)
-            fileManager.createFile(atPath: stdoutURL.path, contents: nil)
-            fileManager.createFile(atPath: stderrURL.path, contents: nil)
-            process.standardOutput = try FileHandle(forWritingTo: stdoutURL)
-            process.standardError = try FileHandle(forWritingTo: stderrURL)
-        } catch {
-            try? fileManager.removeItem(at: scratchDirectory)
-            return CommandResult(output: "", error: error.localizedDescription, exitCode: -1)
-        }
-        defer { try? fileManager.removeItem(at: scratchDirectory) }
-
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in exited.signal() }
-
-        do {
-            try process.run()
-        } catch {
-            return CommandResult(output: "", error: error.localizedDescription, exitCode: -1)
-        }
-
-        var timedOut = false
-        if exited.wait(timeout: .now() + timeout) == .timedOut {
-            timedOut = true
-            process.terminate()
-            if exited.wait(timeout: .now() + 5) == .timedOut {
-                kill(process.processIdentifier, SIGKILL)
-                _ = exited.wait(timeout: .now() + 5)
-            }
-        }
-        process.waitUntilExit()
-
-        let output = (try? String(contentsOf: stdoutURL, encoding: .utf8)) ?? ""
-        var error = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
-        if timedOut {
-            let note = "Git command exceeded its \(Int(timeout)) second limit and was stopped."
-            error = error.isEmpty ? note : error + "\n" + note
-        }
-        return CommandResult(
-            output: output.trimmingCharacters(in: .whitespacesAndNewlines),
-            error: error.trimmingCharacters(in: .whitespacesAndNewlines),
-            exitCode: process.terminationStatus
-        )
     }
 }
 
@@ -223,6 +78,17 @@ enum CommitFlowError: LocalizedError {
 enum CommitService {
     private static let maxPromptCharacters = 60_000
 
+    static func requireCheckout(_ repository: RepositorySnapshot) throws {
+        let prefix = ["-C", repository.path.path]
+        let top = GitCommand.run(prefix + ["rev-parse", "--show-toplevel"])
+        let common = GitCommand.run(prefix + ["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        guard top.exitCode == 0, common.exitCode == 0,
+              GitPath.canonical(URL(fileURLWithPath: top.output)) == repository.path,
+              GitPath.canonical(URL(fileURLWithPath: common.output)) == repository.commonDirectory else {
+            throw CommitFlowError.command("This checkout is unavailable or its Git identity changed. Refresh before taking an action.")
+        }
+    }
+
     static var apiKey: String? {
         let environment = ProcessInfo.processInfo.environment
         return [environment["openrouter_api_key"], environment["OPENROUTER_API_KEY"]]
@@ -238,6 +104,7 @@ enum CommitService {
     }
 
     static func context(for repository: RepositorySnapshot) throws -> CommitContext {
+        try requireCheckout(repository)
         let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
         let status = GitCommand.run(prefix + ["status", "--short", "--branch", "--untracked-files=all"])
         guard status.exitCode == 0 else {
@@ -373,6 +240,7 @@ enum CommitService {
     }
 
     static func pull(repository: RepositorySnapshot) throws -> String {
+        try requireCheckout(repository)
         let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
         let status = GitCommand.run(prefix + ["status", "--porcelain", "--untracked-files=all"])
         guard status.exitCode == 0 else {
@@ -389,6 +257,7 @@ enum CommitService {
     }
 
     static func push(repository: RepositorySnapshot) throws -> String {
+        try requireCheckout(repository)
         let prefix = ["-C", repository.path.path]
         let branchResult = GitCommand.run(prefix + ["symbolic-ref", "--quiet", "--short", "HEAD"])
         guard branchResult.exitCode == 0, !branchResult.output.isEmpty else {
@@ -494,6 +363,7 @@ enum CommitService {
 
 enum BranchActionService {
     static func deleteSafely(repository: RepositorySnapshot, branch: BranchTrackingStatus) throws -> String {
+        try CommitService.requireCheckout(repository)
         guard branch.canCleanUpSafely else {
             throw CommitFlowError.command("\(branch.name) is not an unpublished or stale local branch.")
         }
@@ -512,6 +382,7 @@ enum BranchActionService {
     }
 
     static func push(repository: RepositorySnapshot, branch: BranchTrackingStatus) throws -> String {
+        try CommitService.requireCheckout(repository)
         guard branch.canPublish || branch.canPush else {
             throw CommitFlowError.command("\(branch.name) has no commits waiting to be pushed.")
         }
@@ -548,218 +419,6 @@ enum BranchActionService {
     }
 }
 
-enum RepositoryScanner {
-    /// Generated dependency folders that never contain user projects. These are
-    /// skipped everywhere without looking inside. Dot-prefixed folders need no
-    /// entry here because enumeration skips hidden files already.
-    private static let alwaysSkippedDirectoryNames: Set<String> = [
-        ".build", ".cache", ".gradle", ".idea", ".next", ".nuxt",
-        ".swiftpm", ".terraform", ".venv", "DerivedData", "Pods", "coverage",
-        "node_modules"
-    ]
-
-    /// Generic names that sometimes hold real projects. Skipped only when
-    /// neither the folder itself nor its direct children contain a repository,
-    /// so a checkout named `vendor` or a project at `vendor/service` is found.
-    private static let conditionallySkippedDirectoryNames: Set<String> = [
-        "Build", "Library", "Temp", "bin", "dist", "obj", "vendor"
-    ]
-
-    static func scan(roots: [URL], fetchRemotes: Bool) async -> [RepositorySnapshot] {
-        let repositories = discoverRepositories(in: roots)
-        guard !repositories.isEmpty else { return [] }
-
-        return await withTaskGroup(of: RepositorySnapshot.self) { group in
-            var iterator = repositories.makeIterator()
-            for _ in 0..<min(6, repositories.count) {
-                if let repository = iterator.next() {
-                    group.addTask { inspect(repository.path, root: repository.root, fetchRemotes: fetchRemotes) }
-                }
-            }
-
-            var results: [RepositorySnapshot] = []
-            while let snapshot = await group.next() {
-                results.append(snapshot)
-                if let repository = iterator.next() {
-                    group.addTask { inspect(repository.path, root: repository.root, fetchRemotes: fetchRemotes) }
-                }
-            }
-            return results
-        }
-    }
-
-    static func cleanupGoneBranches(in repositories: [RepositorySnapshot]) async -> BranchCleanupResult {
-        await withTaskGroup(of: BranchCleanupResult.self) { group in
-            for repository in repositories where repository.branches.contains(where: \.upstreamGone) {
-                group.addTask {
-                    var deletedCount = 0
-                    var failures: [BranchCleanupFailure] = []
-                    for branch in repository.branches.filter(\.upstreamGone) {
-                        let result = GitCommand.run([
-                            "-C", repository.path.path,
-                            "branch", "--delete", "--", branch.name
-                        ])
-                        if result.exitCode == 0 {
-                            deletedCount += 1
-                        } else {
-                            let detail = result.error
-                                .split(separator: "\n", omittingEmptySubsequences: true)
-                                .first
-                                .map(String.init) ?? "Branch is checked out or has unmerged commits"
-                            failures.append(BranchCleanupFailure(
-                                repositoryName: repository.name,
-                                branchName: branch.name,
-                                reason: detail
-                            ))
-                        }
-                    }
-                    return BranchCleanupResult(deletedCount: deletedCount, failures: failures)
-                }
-            }
-
-            var deletedCount = 0
-            var failures: [BranchCleanupFailure] = []
-            for await result in group {
-                deletedCount += result.deletedCount
-                failures.append(contentsOf: result.failures)
-            }
-            return BranchCleanupResult(deletedCount: deletedCount, failures: failures)
-        }
-    }
-
-    private static func discoverRepositories(in roots: [URL]) -> [(path: URL, root: URL)] {
-        var found: [String: (URL, URL)] = [:]
-        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
-
-        for root in roots.map(\.standardizedFileURL) {
-            if isGitRepository(root) { found[root.path] = (root, root) }
-
-            guard let enumerator = FileManager.default.enumerator(
-                at: root,
-                includingPropertiesForKeys: keys,
-                options: [.skipsHiddenFiles, .skipsPackageDescendants],
-                errorHandler: { _, _ in true }
-            ) else { continue }
-
-            for case let url as URL in enumerator {
-                let values = try? url.resourceValues(forKeys: Set(keys))
-                guard values?.isDirectory == true else { continue }
-                if values?.isSymbolicLink == true {
-                    enumerator.skipDescendants()
-                    continue
-                }
-                let name = url.lastPathComponent
-                if alwaysSkippedDirectoryNames.contains(name)
-                    || (conditionallySkippedDirectoryNames.contains(name) && !containsNearbyRepository(url)) {
-                    enumerator.skipDescendants()
-                    continue
-                }
-                if isGitRepository(url) { found[url.standardizedFileURL.path] = (url.standardizedFileURL, root) }
-            }
-        }
-
-        return found.values
-            .map { (path: $0.0, root: $0.1) }
-            .sorted { $0.path.path.localizedStandardCompare($1.path.path) == .orderedAscending }
-    }
-
-    private static func isGitRepository(_ url: URL) -> Bool {
-        FileManager.default.fileExists(atPath: url.appendingPathComponent(".git").path)
-    }
-
-    /// One cheap directory level decides whether a generically named folder
-    /// might contain projects. Only a direct-child `.git` triggers a full
-    /// descent; everything else is skipped without walking the tree.
-    private static func containsNearbyRepository(_ directory: URL) -> Bool {
-        if isGitRepository(directory) { return true }
-        let children = (try? FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil,
-            options: [.skipsHiddenFiles]
-        )) ?? []
-        return children.contains { isGitRepository($0) }
-    }
-
-    private static func inspect(_ path: URL, root: URL, fetchRemotes: Bool) -> RepositorySnapshot {
-        let prefix = ["-C", path.path, "-c", "core.quotePath=false"]
-        let remotes = GitCommand.run(prefix + ["remote"])
-        var fetchError: String?
-        if fetchRemotes, remotes.exitCode == 0, !remotes.output.isEmpty {
-            let fetch = GitCommand.run(prefix + ["fetch", "--all", "--prune", "--quiet"], timeout: 600)
-            if fetch.exitCode != 0 { fetchError = fetch.error.isEmpty ? "Fetch failed" : fetch.error }
-        }
-
-        let rawStatus = GitCommand.run(prefix + ["status", "--porcelain=v2", "--branch", "--untracked-files=normal"])
-        let parsed = GitStatusParser.parse(rawStatus.output)
-        let rawBranches = GitCommand.run(prefix + [
-            "for-each-ref",
-            "--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:unix)",
-            "refs/heads"
-        ])
-        let parsedBranches = rawBranches.exitCode == 0 ? BranchTrackingParser.parse(rawBranches.output) : []
-        let checkoutReflog = GitCommand.run(prefix + [
-            "reflog", "show", "--date=unix", "--format=%gD%x09%gs", "HEAD"
-        ])
-        let checkoutDates = checkoutReflog.exitCode == 0
-            ? BranchActivityParser.lastCheckoutDates(
-                checkoutReflog.output,
-                branchNames: Set(parsedBranches.map(\.name))
-            )
-            : [:]
-        let branches = parsedBranches.map { branch in
-            let isPublishedWithoutUpstream: Bool
-            if branch.upstream == nil {
-                let containingRemotes = GitCommand.run(prefix + ["branch", "--remotes", "--contains", branch.name])
-                isPublishedWithoutUpstream = containingRemotes.exitCode == 0 && !containingRemotes.output.isEmpty
-            } else {
-                isPublishedWithoutUpstream = branch.isPublishedWithoutUpstream
-            }
-            let creationDate: Date?
-            if branch.upstreamGone {
-                let branchReflog = GitCommand.run(prefix + [
-                    "reflog", "show", "--date=unix", "--format=%gD%x09%gs", branch.name
-                ])
-                creationDate = branchReflog.exitCode == 0
-                    ? BranchActivityParser.approximateCreationDate(branchReflog.output)
-                    : nil
-            } else {
-                creationDate = nil
-            }
-            return BranchTrackingStatus(
-                name: branch.name,
-                upstream: branch.upstream,
-                ahead: branch.ahead,
-                behind: branch.behind,
-                isPublishedWithoutUpstream: isPublishedWithoutUpstream,
-                upstreamGone: branch.upstreamGone,
-                lastCommitDate: branch.lastCommitDate,
-                lastCheckoutDate: checkoutDates[branch.name],
-                approximateCreatedDate: creationDate
-            )
-        }
-        let remoteURLResult = GitCommand.run(prefix + ["remote", "get-url", "origin"])
-        let commit = GitCommand.run(prefix + ["log", "-1", "--format=%h%x09%ar%x09%s"])
-        let commitFields = commit.output.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
-
-        return RepositorySnapshot(
-            path: path,
-            workspaceRoot: root,
-            branch: parsed.branch,
-            upstream: parsed.upstream,
-            ahead: parsed.ahead,
-            behind: parsed.behind,
-            changes: parsed.changes,
-            branches: branches,
-            remoteURL: remoteURLResult.exitCode == 0 && !remoteURLResult.output.isEmpty ? remoteURLResult.output : nil,
-            lastCommitHash: commitFields.indices.contains(0) && !commitFields[0].isEmpty ? commitFields[0] : nil,
-            lastCommitAge: commitFields.indices.contains(1) ? commitFields[1] : nil,
-            lastCommitSubject: commitFields.indices.contains(2) ? commitFields[2] : nil,
-            fetchError: fetchError,
-            statusError: rawStatus.exitCode == 0 ? nil : (rawStatus.error.isEmpty ? "Unable to read Git status" : rawStatus.error)
-        )
-    }
-}
-
 enum RepositoryScope: String, CaseIterable, Identifiable {
     case attention
     case all
@@ -790,6 +449,8 @@ final class RepositoryStore: ObservableObject {
     @Published var query = ""
     @Published var isRefreshing = false
     @Published var isCleaningBranches = false
+    @Published var worktreeToRemove: RepositorySnapshot?
+    @Published var isRemovingWorktree = false
     @Published var cleanupResult: BranchCleanupResult?
     @Published var commitConsentRepository: RepositorySnapshot?
     @Published var commitDraft: CommitDraft?
@@ -822,26 +483,29 @@ final class RepositoryStore: ObservableObject {
         repositories.first { $0.id == selectedRepositoryID }
     }
 
-    var attentionCount: Int { repositories.filter(\.needsAttention).count }
-    var cleanCount: Int { repositories.filter(\.isClean).count }
-    var uncommittedCount: Int { repositories.filter { !$0.changes.isEmpty }.count }
-    var unpushedCount: Int { repositories.filter { !$0.unpublishedBranches.isEmpty }.count }
-    var fetchWarningCount: Int { repositories.filter { $0.fetchError != nil }.count }
+    var repositoryGroups: [RepositoryGroup] { RepositoryGroup.grouping(repositories) }
+    var canRequestWorktreeRemoval: Bool {
+        !isRefreshing && !isRemovingWorktree && !isCleaningBranches && branchActionIDs.isEmpty &&
+        !isGeneratingCommit && !isCommitting && !isPushing && !isPulling &&
+        commitDraft == nil && commitConsentRepository == nil
+    }
+    var selectedGroup: RepositoryGroup? {
+        guard let selectedRepository else { return nil }
+        return repositoryGroups.first { $0.id == selectedRepository.commonDirectory.path }
+    }
+    var attentionCount: Int { repositoryGroups.filter(\.needsAttention).count }
+    var cleanCount: Int { repositoryGroups.filter(\.isClean).count }
+    var uncommittedCount: Int { repositoryGroups.filter { $0.workingTreeChangeCount > 0 }.count }
+    var unpushedCount: Int { repositoryGroups.filter { !$0.unpublishedBranches.isEmpty }.count }
+    var fetchWarningCount: Int { repositoryGroups.filter { $0.primary.fetchError != nil }.count }
     var goneUpstreamBranchCount: Int {
-        repositories.reduce(0) { count, repository in
-            count + repository.branches.filter(\.upstreamGone).count
-        }
+        repositoryGroups.reduce(0) { $0 + $1.primary.branches.filter(\.upstreamGone).count }
     }
 
-    var visibleRepositories: [RepositorySnapshot] {
-        var values = scope == .attention ? repositories.filter(\.needsAttention) : repositories
+    var visibleRepositories: [RepositoryGroup] {
+        var values = scope == .attention ? repositoryGroups.filter(\.needsAttention) : repositoryGroups
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
-            values = values.filter {
-                [$0.name, $0.path.path, $0.branch, $0.upstream ?? ""]
-                    .contains { $0.localizedCaseInsensitiveContains(trimmed) }
-            }
-        }
+        if !trimmed.isEmpty { values = values.filter { $0.matches(trimmed) } }
         return values.sorted { lhs, rhs in
             switch sort {
             case .priority:
@@ -869,7 +533,7 @@ final class RepositoryStore: ObservableObject {
     func addRoots() {
         let panel = NSOpenPanel()
         panel.title = "Choose folders to watch"
-        panel.message = "Git Review will inspect these folders and their subfolders for Git repositories."
+        panel.message = "Git Review will inspect these folders for repositories, then follow their registered worktrees even outside the watched folders."
         panel.prompt = "Watch Folders"
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
@@ -891,7 +555,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func refresh() {
-        guard !isRefreshing else { return }
+        guard !isRefreshing, !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !roots.isEmpty else {
             repositories = []
             selectedRepositoryID = nil
@@ -913,14 +577,15 @@ final class RepositoryStore: ObservableObject {
             if next.isEmpty {
                 statusText = "No Git repositories found"
             } else if attentionCount == 0 {
-                statusText = "All \(next.count) repositories are up to date"
+                statusText = "All \(repositoryGroups.count) repositories are up to date"
             } else {
-                statusText = "\(attentionCount) of \(next.count) repositories need attention"
+                statusText = "\(attentionCount) of \(repositoryGroups.count) repositories need attention"
             }
         }
     }
 
     func cleanupGoneBranches() {
+        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !isCleaningBranches, goneUpstreamBranchCount > 0 else { return }
         isCleaningBranches = true
         statusText = "Safely deleting merged branches with gone upstreams..."
@@ -939,6 +604,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func requestCommit(_ repository: RepositorySnapshot) {
+        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !repository.changes.isEmpty else {
             commitFlowError = CommitFlowError.noChanges.localizedDescription
             return
@@ -1021,6 +687,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func push(_ repository: RepositorySnapshot) {
+        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !isPushing else { return }
         guard repository.currentBranchNeedsPush else {
             commitFlowError = "The current branch has no commits waiting to be pushed."
@@ -1044,6 +711,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func pull(_ repository: RepositorySnapshot) {
+        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !isPulling else { return }
         guard repository.changes.isEmpty else {
             commitFlowError = "Commit or discard local changes before pulling. Nothing was changed."
@@ -1075,6 +743,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func cleanupBranch(repository: RepositorySnapshot, branch: BranchTrackingStatus) {
+        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
         let actionID = branchActionID(repository: repository, branch: branch)
         guard !branchActionIDs.contains(actionID) else { return }
         branchActionIDs.insert(actionID)
@@ -1096,6 +765,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func pushBranch(repository: RepositorySnapshot, branch: BranchTrackingStatus) {
+        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
         let actionID = branchActionID(repository: repository, branch: branch)
         guard !branchActionIDs.contains(actionID) else { return }
         branchActionIDs.insert(actionID)
@@ -1117,6 +787,45 @@ final class RepositoryStore: ObservableObject {
     }
 
     func select(_ id: RepositorySnapshot.ID?) { selectedRepositoryID = id }
+
+    func requestWorktreeRemoval(_ checkout: RepositorySnapshot) {
+        guard canRequestWorktreeRemoval else { return }
+        if let reason = WorktreeRemoval.disabledReason(for: checkout) {
+            commitFlowError = reason
+            return
+        }
+        worktreeToRemove = checkout
+    }
+
+    func removeWorktree(_ checkout: RepositorySnapshot) {
+        guard canRequestWorktreeRemoval, worktreeToRemove?.id == checkout.id else { return }
+        worktreeToRemove = nil
+        isRemovingWorktree = true
+        statusText = "Removing worktree at \(checkout.path.path)…"
+        Task {
+            do {
+                _ = try await Task.detached(priority: .userInitiated) {
+                    try WorktreeRemoval.remove(checkout)
+                }.value
+                repositories.removeAll { $0.id == checkout.id }
+                if selectedRepositoryID == checkout.id {
+                    selectedRepositoryID = repositoryGroups.first { $0.id == checkout.commonDirectory.path }?.preferredCheckout.id
+                }
+            } catch {
+                commitFlowError = error.localizedDescription
+            }
+            isRemovingWorktree = false
+            refresh()
+        }
+    }
+
+    func selectGroup(_ id: RepositoryGroup.ID?) {
+        guard let group = repositoryGroups.first(where: { $0.id == id }) else {
+            selectedRepositoryID = nil
+            return
+        }
+        if selectedGroup?.id != group.id { select(group.preferredCheckout.id) }
+    }
 
     func reveal(_ repository: RepositorySnapshot) {
         NSWorkspace.shared.activateFileViewerSelecting([repository.path])
@@ -1142,7 +851,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     private func branchActionID(repository: RepositorySnapshot, branch: BranchTrackingStatus) -> String {
-        repository.id + "\u{0}" + branch.name
+        repository.commonDirectory.path + "\u{0}" + branch.name
     }
 }
 
@@ -1201,7 +910,7 @@ struct ContentView: View {
             }
             ToolbarItemGroup {
                 SortMenu()
-                if store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling {
+                if store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling || store.isRemovingWorktree {
                     ProgressView().controlSize(.small)
                 }
                 Toggle(isOn: $store.fetchRemotes) {
@@ -1232,11 +941,11 @@ struct ContentView: View {
                     Label("Clean Gone Branches", systemImage: "trash")
                 }
                 .help("Safely delete merged local branches whose upstream branch is gone")
-                .disabled(store.goneUpstreamBranchCount == 0 || store.isRefreshing || store.isCleaningBranches || !store.branchActionIDs.isEmpty)
+                .disabled(store.goneUpstreamBranchCount == 0 || store.isRefreshing || store.isCleaningBranches || !store.branchActionIDs.isEmpty || store.isRemovingWorktree)
                 Button { store.refresh() } label: {
                     Label("Refresh", systemImage: "arrow.clockwise")
                 }
-                .disabled(store.isRefreshing || store.roots.isEmpty)
+                .disabled(store.isRefreshing || store.roots.isEmpty || store.isRemovingWorktree)
             }
         }
         .searchable(text: $store.query, placement: .sidebar, prompt: "Filter repositories")
@@ -1280,6 +989,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: commitDraftPresented) {
             CommitDraftSheet().environmentObject(store)
+        }
+        .sheet(item: $store.worktreeToRemove) { checkout in
+            WorktreeRemovalSheet(checkout: checkout).environmentObject(store)
         }
         .onAppear { store.start() }
     }
@@ -1332,14 +1044,16 @@ struct RepositoryList: View {
     @EnvironmentObject private var store: RepositoryStore
 
     var body: some View {
-        List(selection: Binding(get: { store.selectedRepositoryID }, set: { store.select($0) })) {
+        List(selection: Binding(get: { store.selectedGroup?.id }, set: { store.selectGroup($0) })) {
             ForEach(store.visibleRepositories) { repository in
                 RepositoryRow(repository: repository)
                     .tag(repository.id)
                     .contextMenu {
-                        Button("Open in Terminal") { store.openTerminal(repository) }
-                        Button("Reveal in Finder") { store.reveal(repository) }
-                        Button("Copy Path") { store.copyPath(repository) }
+                        Button("Open in Terminal") { store.openTerminal(repository.actionCheckout) }
+                            .disabled(!repository.actionCheckout.canAccessCheckout)
+                        Button("Reveal in Finder") { store.reveal(repository.actionCheckout) }
+                            .disabled(!repository.actionCheckout.canAccessCheckout)
+                        Button("Copy Path") { store.copyPath(repository.actionCheckout) }
                     }
             }
         }
@@ -1356,7 +1070,7 @@ struct RepositoryList: View {
                     }
                 } else if store.repositories.isEmpty && store.isRefreshing {
                     ProgressView("Scanning folders...")
-                } else if store.scope == .attention && !store.repositories.isEmpty {
+                } else if store.scope == .attention && store.attentionCount == 0 && !store.repositories.isEmpty {
                     ContentUnavailableView(
                         "Everything Is Accounted For",
                         systemImage: "checkmark.seal",
@@ -1375,11 +1089,12 @@ struct RepositoryList: View {
 }
 
 struct RepositoryRow: View {
-    let repository: RepositorySnapshot
+    let repository: RepositoryGroup
 
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
-            StatusDot(repository: repository, size: 9).padding(.top, 5)
+            Circle().fill(statusColor).frame(width: 9, height: 9).padding(.top, 5)
+                .accessibilityLabel(repository.statusLabel)
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
                     Text(repository.name).font(.body.weight(.semibold)).lineLimit(1)
@@ -1388,13 +1103,17 @@ struct RepositoryRow: View {
                         .foregroundStyle(statusColor)
                         .lineLimit(1)
                 }
-                Text(repository.relativePath)
+                Text(repository.path.path)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 HStack(spacing: 11) {
-                    Label(repository.branch, systemImage: "arrow.triangle.branch")
+                    if repository.worktrees.count > 1 {
+                        Label("\(repository.worktrees.count) worktrees", systemImage: "square.stack.3d.up")
+                    } else {
+                        Label(repository.primary.branch, systemImage: "arrow.triangle.branch")
+                    }
                     if repository.workingTreeChangeCount > 0 {
                         Label("\(repository.workingTreeChangeCount) file\(repository.workingTreeChangeCount == 1 ? "" : "s")", systemImage: "doc.badge.ellipsis")
                     }
@@ -1412,13 +1131,13 @@ struct RepositoryRow: View {
 
     private var pushSummary: String {
         let commits = repository.unpublishedCommitCount
-        let local = repository.localOnlyBranchCount
+        let local = repository.unpublishedBranches.count
         if commits > 0 { return "\(commits) ahead" }
         return "\(local) local branch\(local == 1 ? "" : "es")"
     }
 
     private var statusColor: Color {
-        repository.isClean ? .green : (repository.statusError == nil ? .orange : .red)
+        repository.isClean ? .green : (repository.riskRank >= 5 ? .red : .orange)
     }
 }
 
@@ -1431,15 +1150,25 @@ struct RepositoryDetail: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
                         DetailHeader(repository: repository)
-                        RepositorySummary(repository: repository)
+                        if let group = store.selectedGroup, group.worktrees.count > 1 || group.primary.path != group.path {
+                            WorktreeSection(group: group)
+                        }
+                        if repository.canAccessCheckout {
+                            RepositorySummary(repository: repository)
+                        }
+                        if let error = repository.worktreeDiscoveryError {
+                            WarningStrip(title: "Worktree coverage incomplete", detail: error)
+                        }
                         if let fetchError = repository.fetchError {
                             WarningStrip(title: "Remote fetch failed", detail: fetchError)
                         }
                         if let statusError = repository.statusError {
-                            WarningStrip(title: "Git status failed", detail: statusError)
+                            WarningStrip(title: repository.isUnavailable ? "Worktree unavailable" : "Git status failed", detail: statusError)
                         }
-                        ChangeSection(repository: repository)
-                        BranchSection(repository: repository)
+                        if repository.canAccessCheckout {
+                            ChangeSection(repository: repository)
+                            BranchSection(repository: repository)
+                        }
                     }
                     .padding(26)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -1529,8 +1258,9 @@ struct DetailHeader: View {
         VStack(alignment: .leading, spacing: 15) {
             HStack(spacing: 12) {
                 StatusDot(repository: repository, size: 12)
-                Text(repository.name).font(.title2.weight(.semibold)).lineLimit(1)
-                StatusPill(text: repository.statusLabel, good: repository.isClean)
+                Text(store.selectedGroup?.name ?? repository.name).font(.title2.weight(.semibold)).lineLimit(1)
+                StatusPill(text: repository.checkoutStatusLabel, good: !repository.checkoutNeedsAttention)
+                    .help("Status of the selected checkout")
                 Spacer()
             }
             Text(repository.path.path)
@@ -1544,28 +1274,30 @@ struct DetailHeader: View {
                     Label("Commit", systemImage: "checkmark.circle")
                 }
                 .fixedSize(horizontal: true, vertical: false)
-                .disabled(repository.changes.isEmpty || store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling)
+                .disabled(!repository.canAccessCheckout || repository.changes.isEmpty || store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling || store.isRemovingWorktree)
                 Button { store.push(repository) } label: {
                     Label("Push", systemImage: "arrow.up.circle")
                 }
                 .fixedSize(horizontal: true, vertical: false)
                 .help(repository.currentBranchNeedsPush ? "Push local commits from \(repository.branch)" : "The current branch has no commits waiting to be pushed")
-                .disabled(!repository.currentBranchNeedsPush || store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling || store.isRefreshing)
+                .disabled(!repository.canAccessCheckout || !repository.currentBranchNeedsPush || store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling || store.isRefreshing || store.isRemovingWorktree)
                 Button { store.pull(repository) } label: {
                     Label("Pull", systemImage: "arrow.down.circle")
                 }
                 .fixedSize(horizontal: true, vertical: false)
                 .help(repository.changes.isEmpty ? "Pull the current branch using fast-forward only" : "Commit or discard local changes before pulling")
-                .disabled(!repository.changes.isEmpty || store.isPulling || store.isPushing || store.isRefreshing || store.isCommitting || store.isGeneratingCommit)
+                .disabled(!repository.canAccessCheckout || repository.worktree.isDetached || !repository.changes.isEmpty || store.isPulling || store.isPushing || store.isRefreshing || store.isCommitting || store.isGeneratingCommit || store.isRemovingWorktree)
                 Button { store.openTerminal(repository) } label: { Label("Open Terminal", systemImage: "terminal") }
+                    .disabled(!repository.canAccessCheckout)
                     .fixedSize(horizontal: true, vertical: false)
                 Button { store.reveal(repository) } label: { Label("Reveal in Finder", systemImage: "folder") }
+                    .disabled(!repository.canAccessCheckout)
                     .fixedSize(horizontal: true, vertical: false)
                 Button { store.copyPath(repository) } label: { Label("Copy Path", systemImage: "doc.on.doc") }
                     .fixedSize(horizontal: true, vertical: false)
                 Button { store.refresh() } label: { Label("Refresh", systemImage: "arrow.clockwise") }
                     .fixedSize(horizontal: true, vertical: false)
-                    .disabled(store.isRefreshing)
+                    .disabled(store.isRefreshing || store.isRemovingWorktree)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -1618,7 +1350,7 @@ struct CommitDraftSheet: View {
                     store.commitGeneratedMessage()
                 }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(store.commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isCommitting)
+                    .disabled(store.commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isCommitting || store.isRemovingWorktree)
             }
         }
         .padding(22)
@@ -1749,7 +1481,7 @@ struct BranchSection: View {
                                     .buttonBorderShape(.capsule)
                                     .controlSize(.small)
                                     .tint(.blue)
-                                    .disabled(store.isRefreshing || store.isCleaningBranches)
+                                    .disabled(store.isRefreshing || store.isCleaningBranches || store.isRemovingWorktree)
                                     .help(branch.canPublish
                                         ? "Publish \(branch.name) to origin and configure its upstream"
                                         : "Push \(branch.name) to its configured upstream")
@@ -1764,7 +1496,7 @@ struct BranchSection: View {
                                     .buttonBorderShape(.capsule)
                                     .controlSize(.small)
                                     .tint(.orange)
-                                    .disabled(store.isRefreshing || store.isCleaningBranches)
+                                    .disabled(store.isRefreshing || store.isCleaningBranches || store.isRemovingWorktree)
                                     .help("Safely delete this local branch; unmerged or checked-out branches are preserved")
                                 }
                             }
@@ -1845,11 +1577,11 @@ struct StatusDot: View {
             .frame(width: size, height: size)
             .overlay { Circle().stroke(.white.opacity(0.35), lineWidth: 1) }
             .shadow(color: color.opacity(0.4), radius: size * 0.4)
-            .accessibilityLabel(repository.statusLabel)
+            .accessibilityLabel(repository.checkoutStatusLabel)
     }
     private var color: Color {
-        if repository.statusError != nil || repository.conflictCount > 0 { return .red }
-        if repository.needsAttention { return .orange }
+        if repository.isUnavailable || repository.statusError != nil || repository.conflictCount > 0 { return .red }
+        if repository.checkoutNeedsAttention { return .orange }
         return .green
     }
 }
@@ -1942,9 +1674,9 @@ struct MenuBarContent: View {
             if store.attentionCount == 0 {
                 Text(store.repositories.isEmpty ? "No repositories scanned" : "All repositories up to date")
             } else {
-                ForEach(store.repositories.filter(\.needsAttention).sorted { $0.name < $1.name }.prefix(15)) { repository in
+                ForEach(store.repositoryGroups.filter(\.needsAttention).sorted { $0.name < $1.name }.prefix(15)) { repository in
                     Button("\(repository.name) — \(repository.statusLabel)") {
-                        store.select(repository.id)
+                        store.selectGroup(repository.id)
                         NSApp.activate(ignoringOtherApps: true)
                     }
                 }
@@ -1981,7 +1713,7 @@ struct GitReviewApp: App {
                     .keyboardShortcut("o", modifiers: [.command])
                 Button("Refresh Repositories") { store.refresh() }
                     .keyboardShortcut("r", modifiers: [.command])
-                    .disabled(store.roots.isEmpty || store.isRefreshing)
+                    .disabled(store.roots.isEmpty || store.isRefreshing || store.isRemovingWorktree)
             }
         }
     }

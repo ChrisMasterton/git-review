@@ -7,6 +7,8 @@ It follows the same lightweight SwiftUI approach as Container Review: no third-p
 ## What it checks
 
 - Staged, modified, untracked, and conflicted files in each working tree.
+- Every registered linked worktree, including checkouts in hidden directories or outside watched folders. Checkouts are grouped under one repository, with individual paths, branches, and changed-file counts.
+- Unavailable worktrees and incomplete worktree discovery, which keep a repository in Attention instead of reporting it fully checked.
 - Commits ahead of the configured upstream on every local branch, not only the checked-out branch.
 - Local branches without an upstream, unless their tip is already present on a remote branch.
 - Branch activity context: reliable last-commit age, local reflog-derived last-used age, and an approximate creation age when the original branch-creation reflog entry still exists.
@@ -18,6 +20,10 @@ It follows the same lightweight SwiftUI approach as Container Review: no third-p
 - Inline branch actions: publish a local-only branch to `origin`, safely clean up an unpublished or stale branch, or push any tracked branch that is ahead without checking it out first.
 
 Remote fetching is enabled by default so the result reflects work pushed from other computers. Git prompts are disabled during automated refreshes; repositories that need interactive credentials show a fetch warning instead of blocking the scan. Automatic refresh runs every five minutes while the app is open.
+
+Git Review follows Git's registered worktree list from each discovered checkout, so watching a linked checkout also finds its main checkout and siblings. It fetches and counts shared branches once per repository. Select a checkout in the Worktrees section to inspect its files and scope Commit, Push, Pull, Finder, and Terminal actions to that path. Missing or inaccessible checkouts retain their paths and show “Unavailable”; they are not automatically removed or pruned. Independently cloned repositories remain separate even when they have the same remote.
+
+Use a checkout's **… → Remove Worktree…** menu to remove a linked checkout after confirming its exact path. This deletes the checkout directory, including ignored files, but keeps its local branch and commits. For a missing directory, it removes only that worktree's registration. The main checkout cannot be removed; dirty or locked checkouts are protected, and detached commits must be retained by an existing branch or tag. Git Review rechecks the checkout before removal and never forces removal or prunes other worktrees.
 
 ## OpenRouter commit messages
 
@@ -64,7 +70,7 @@ Create a release zip and SHA-256 file:
 
 ## Privacy
 
-Outside the explicitly confirmed OpenRouter commit-message flow, Git Review is local-only. Git runs with interactive prompts disabled; a custom `GIT_SSH_COMMAND` or `GIT_SSH` from your environment is respected rather than replaced. It reads folder paths selected by you and shells out to the local Git CLI for discovery metadata, status, branch tracking, log summary, and remote fetch. Git Review never pushes. Branch deletion and commit actions run only after confirmation.
+Outside the explicitly confirmed OpenRouter commit-message flow, Git Review uses your local Git CLI for status and remote operations. Git runs with interactive prompts disabled; a custom `GIT_SSH_COMMAND` or `GIT_SSH` from your environment is respected rather than replaced. It reads folder paths selected by you and the linked worktree paths registered by those repositories, including paths outside watched folders. It never automatically pushes or removes worktrees; repository actions are initiated by you.
 
 ## License
 

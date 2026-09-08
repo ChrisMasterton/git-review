@@ -1,5 +1,13 @@
 # Release Notes
 
+## Unreleased
+
+- Added confirmed removal of individual linked worktrees from their actions menu, including stale registrations for missing folders. Main, dirty, locked, changed, and unreferenced detached checkouts are protected; local branches are kept.
+- Automatically discover registered linked worktrees, including hidden checkouts and paths outside watched folders, and group them under their repository.
+- Show each checkout's branch, path, changed files, and availability; select a checkout to inspect its files or open its exact folder in Finder or Terminal.
+- Keep repositories with unavailable worktrees or incomplete discovery in Attention. Shared branches, repository counts, and remote fetches are counted once per repository.
+- Recheck checkout identity before Git actions so a removed or replaced checkout cannot fall back to a parent repository.
+
 ## 0.2.0
 
 - Fixed a possible permanent hang when a Git command wrote more than a pipe buffer of output; subprocess output now goes through temporary files and every Git command has an overall timeout, with remote fetches allowed up to ten minutes.

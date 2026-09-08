@@ -10,6 +10,7 @@ let package = Package(
     targets: [
         .target(name: "GitReviewCore"),
         .executableTarget(name: "GitReview", dependencies: ["GitReviewCore"]),
-        .testTarget(name: "GitReviewCoreTests", dependencies: ["GitReviewCore"])
+        .testTarget(name: "GitReviewCoreTests", dependencies: ["GitReviewCore"]),
+        .testTarget(name: "GitReviewTests", dependencies: ["GitReview"])
     ]
 )
