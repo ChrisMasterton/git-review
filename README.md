@@ -27,7 +27,7 @@ Use a checkout's **… → Remove Worktree…** menu to remove a linked checkout
 
 ## OpenRouter commit messages
 
-Set either `openrouter_api_key` or `OPENROUTER_API_KEY` in the environment used to launch Git Review. `OPENROUTER_MODEL` can optionally override the default `openrouter/auto` model.
+Export either `openrouter_api_key` or `OPENROUTER_API_KEY` in your shell configuration (for example, `~/.zshrc`) or set it in the environment used to launch Git Review. Apps opened from Finder or the Dock do not inherit Terminal's shell exports, so when no key is inherited, Git Review reads the OpenRouter settings from your interactive login shell. This lookup runs in the background with a five-second timeout and keeps the values in memory. Inherited app settings take precedence. `openrouter_model` or `OPENROUTER_MODEL` can optionally override the default `openrouter/auto` model. The shell fallback is checked on each generation attempt, so changes to shell exports can be picked up by retrying.
 
 The Commit button first asks for permission to send data. Git Review redacts common credential formats, caps the request payload, and sends tracked diffs plus status information; untracked file contents are not sent. The generated message remains editable. Before staging anything, the app verifies that the working change set still matches the one used to generate the message, protecting against another agent changing the repository during review.
 

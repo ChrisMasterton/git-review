@@ -62,7 +62,7 @@ enum CommitFlowError: LocalizedError {
     var errorDescription: String? {
         switch self {
         case .noAPIKey:
-            return "OpenRouter API key not found. Set openrouter_api_key or OPENROUTER_API_KEY in the environment used to launch Git Review, then reopen the app."
+            return "OpenRouter API key not found in the app environment or your login shell. Export openrouter_api_key or OPENROUTER_API_KEY in your shell configuration (for example, ~/.zshrc), then try again."
         case .noChanges:
             return "No pending changes were found to commit."
         case .changedSinceGeneration:
@@ -87,20 +87,6 @@ enum CommitService {
               GitPath.canonical(URL(fileURLWithPath: common.output)) == repository.commonDirectory else {
             throw CommitFlowError.command("This checkout is unavailable or its Git identity changed. Refresh before taking an action.")
         }
-    }
-
-    static var apiKey: String? {
-        let environment = ProcessInfo.processInfo.environment
-        return [environment["openrouter_api_key"], environment["OPENROUTER_API_KEY"]]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty }
-    }
-
-    static var model: String {
-        let environment = ProcessInfo.processInfo.environment
-        return [environment["openrouter_model"], environment["OPENROUTER_MODEL"]]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .first { !$0.isEmpty } ?? "openrouter/auto"
     }
 
     static func context(for repository: RepositorySnapshot) throws -> CommitContext {
@@ -168,7 +154,7 @@ enum CommitService {
         )
     }
 
-    static func generateMessage(context: CommitContext, apiKey: String) async throws -> (message: String, model: String) {
+    static func generateMessage(context: CommitContext, apiKey: String, model: String) async throws -> (message: String, model: String) {
         guard let url = URL(string: "https://openrouter.ai/api/v1/chat/completions") else {
             throw CommitFlowError.invalidResponse("OpenRouter endpoint is invalid.")
         }
@@ -609,10 +595,6 @@ final class RepositoryStore: ObservableObject {
             commitFlowError = CommitFlowError.noChanges.localizedDescription
             return
         }
-        guard CommitService.apiKey != nil else {
-            commitFlowError = CommitFlowError.noAPIKey.localizedDescription
-            return
-        }
         commitConsentRepository = repository
     }
 
@@ -622,21 +604,20 @@ final class RepositoryStore: ObservableObject {
 
     func generateCommitMessage() {
         guard let repository = commitConsentRepository else { return }
-        guard let apiKey = CommitService.apiKey else {
-            commitConsentRepository = nil
-            commitFlowError = CommitFlowError.noAPIKey.localizedDescription
-            return
-        }
         commitConsentRepository = nil
         isGeneratingCommit = true
         statusText = "Generating a commit message for \(repository.name)..."
 
         Task {
             do {
+                let configuration = await Task.detached(priority: .userInitiated) {
+                    OpenRouterConfiguration.load()
+                }.value
+                guard let apiKey = configuration.apiKey else { throw CommitFlowError.noAPIKey }
                 let context = try await Task.detached(priority: .userInitiated) {
                     try CommitService.context(for: repository)
                 }.value
-                let generated = try await CommitService.generateMessage(context: context, apiKey: apiKey)
+                let generated = try await CommitService.generateMessage(context: context, apiKey: apiKey, model: configuration.model)
                 commitDraft = CommitDraft(
                     repository: repository,
                     fingerprint: context.fingerprint,
