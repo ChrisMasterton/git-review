@@ -348,14 +348,14 @@ enum CommitService {
 }
 
 enum BranchActionService {
-    static func deleteSafely(repository: RepositorySnapshot, branch: BranchTrackingStatus) throws -> String {
+    static func deleteSafely(repository: RepositorySnapshot, branch: BranchTrackingStatus, force: Bool = false) throws -> String {
         try CommitService.requireCheckout(repository)
         guard branch.canCleanUpSafely else {
             throw CommitFlowError.command("\(branch.name) is not an unpublished or stale local branch.")
         }
         let result = GitCommand.run([
             "-C", repository.path.path,
-            "branch", "--delete", "--", branch.name
+            "branch", "--delete", force ? "--force" : "--no-force", "--", branch.name
         ])
         guard result.exitCode == 0 else {
             throw CommitFlowError.command(
@@ -437,6 +437,7 @@ final class RepositoryStore: ObservableObject {
     @Published var isCleaningBranches = false
     @Published var worktreeToRemove: RepositorySnapshot?
     @Published var isRemovingWorktree = false
+    @Published var isDiscardingChanges = false
     @Published var cleanupResult: BranchCleanupResult?
     @Published var commitConsentRepository: RepositorySnapshot?
     @Published var commitDraft: CommitDraft?
@@ -471,7 +472,7 @@ final class RepositoryStore: ObservableObject {
 
     var repositoryGroups: [RepositoryGroup] { RepositoryGroup.grouping(repositories) }
     var canRequestWorktreeRemoval: Bool {
-        !isRefreshing && !isRemovingWorktree && !isCleaningBranches && branchActionIDs.isEmpty &&
+        !isDiscardingChanges && !isRefreshing && !isRemovingWorktree && !isCleaningBranches && branchActionIDs.isEmpty &&
         !isGeneratingCommit && !isCommitting && !isPushing && !isPulling &&
         commitDraft == nil && commitConsentRepository == nil
     }
@@ -541,7 +542,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func refresh() {
-        guard !isRefreshing, !isRemovingWorktree, worktreeToRemove == nil else { return }
+        guard !isDiscardingChanges, !isRefreshing, !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !roots.isEmpty else {
             repositories = []
             selectedRepositoryID = nil
@@ -571,7 +572,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func cleanupGoneBranches() {
-        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
+        guard !isDiscardingChanges, !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !isCleaningBranches, goneUpstreamBranchCount > 0 else { return }
         isCleaningBranches = true
         statusText = "Safely deleting merged branches with gone upstreams..."
@@ -590,7 +591,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func requestCommit(_ repository: RepositorySnapshot) {
-        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
+        guard !isDiscardingChanges, !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !repository.changes.isEmpty else {
             commitFlowError = CommitFlowError.noChanges.localizedDescription
             return
@@ -668,7 +669,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func push(_ repository: RepositorySnapshot) {
-        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
+        guard !isDiscardingChanges, !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !isPushing else { return }
         guard repository.currentBranchNeedsPush else {
             commitFlowError = "The current branch has no commits waiting to be pushed."
@@ -692,7 +693,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func pull(_ repository: RepositorySnapshot) {
-        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
+        guard !isDiscardingChanges, !isRemovingWorktree, worktreeToRemove == nil else { return }
         guard !isPulling else { return }
         guard repository.changes.isEmpty else {
             commitFlowError = "Commit or discard local changes before pulling. Nothing was changed."
@@ -723,16 +724,16 @@ final class RepositoryStore: ObservableObject {
         branchActionIDs.contains(branchActionID(repository: repository, branch: branch))
     }
 
-    func cleanupBranch(repository: RepositorySnapshot, branch: BranchTrackingStatus) {
-        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
+    func cleanupBranch(repository: RepositorySnapshot, branch: BranchTrackingStatus, force: Bool = false) {
+        guard !isDiscardingChanges, !isRemovingWorktree, worktreeToRemove == nil else { return }
         let actionID = branchActionID(repository: repository, branch: branch)
         guard !branchActionIDs.contains(actionID) else { return }
         branchActionIDs.insert(actionID)
-        statusText = "Safely deleting \(branch.name)..."
+        statusText = "Deleting \(branch.name)..."
         Task {
             do {
                 let result = try await Task.detached(priority: .userInitiated) {
-                    try BranchActionService.deleteSafely(repository: repository, branch: branch)
+                    try BranchActionService.deleteSafely(repository: repository, branch: branch, force: force)
                 }.value
                 statusText = result
                 branchActionIDs.remove(actionID)
@@ -746,7 +747,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func pushBranch(repository: RepositorySnapshot, branch: BranchTrackingStatus) {
-        guard !isRemovingWorktree, worktreeToRemove == nil else { return }
+        guard !isDiscardingChanges, !isRemovingWorktree, worktreeToRemove == nil else { return }
         let actionID = branchActionID(repository: repository, branch: branch)
         guard !branchActionIDs.contains(actionID) else { return }
         branchActionIDs.insert(actionID)
@@ -786,7 +787,7 @@ final class RepositoryStore: ObservableObject {
         Task {
             do {
                 _ = try await Task.detached(priority: .userInitiated) {
-                    try WorktreeRemoval.remove(checkout)
+                    try WorktreeRemoval.remove(checkout, discardChanges: true)
                 }.value
                 repositories.removeAll { $0.id == checkout.id }
                 if selectedRepositoryID == checkout.id {
@@ -795,6 +796,41 @@ final class RepositoryStore: ObservableObject {
             } catch {
                 commitFlowError = error.localizedDescription
             }
+            isRemovingWorktree = false
+            refresh()
+        }
+    }
+
+    func discardChanges(_ request: DiscardRequest) {
+        guard canRequestWorktreeRemoval, worktreeToRemove == nil else { return }
+        isDiscardingChanges = true
+        statusText = "Discarding \(request.change.path)…"
+        Task {
+            do {
+                _ = try await Task.detached(priority: .userInitiated) {
+                    try DiscardChanges.discard(repository: request.repository, change: request.change)
+                }.value
+            } catch { commitFlowError = error.localizedDescription }
+            isDiscardingChanges = false
+            refresh()
+        }
+    }
+
+    func clearMissingWorktrees(_ checkouts: [RepositorySnapshot]) {
+        guard canRequestWorktreeRemoval, !checkouts.isEmpty else { return }
+        isRemovingWorktree = true
+        statusText = "Clearing missing worktree registrations…"
+        Task {
+            do {
+                let removed = try await Task.detached(priority: .userInitiated) {
+                    try WorktreeRemoval.clearMissingRegistrations(checkouts)
+                }.value
+                repositories.removeAll { removed.contains($0.id) }
+                if let selectedRepositoryID, removed.contains(selectedRepositoryID) {
+                    self.selectedRepositoryID = repositoryGroups.first { $0.id == checkouts[0].commonDirectory.path }?.preferredCheckout.id
+                }
+                statusText = "Cleared \(removed.count) stale registrations"
+            } catch { commitFlowError = error.localizedDescription }
             isRemovingWorktree = false
             refresh()
         }
@@ -1391,6 +1427,7 @@ struct ChangeSection: View {
     @EnvironmentObject private var store: RepositoryStore
     @State private var showingGitignore = false
     @State private var directoryToIgnore: String?
+    @State private var discardRequest: DiscardRequest?
     let repository: RepositorySnapshot
 
     var body: some View {
@@ -1420,6 +1457,11 @@ struct ChangeSection: View {
                                 showingGitignore = true
                             }
                         }
+                        Button("Discard…", role: .destructive) {
+                            discardRequest = DiscardRequest(repository: repository, change: change)
+                        }
+                        .disabled(change.isSubmodule || !store.canRequestWorktreeRemoval || store.worktreeToRemove != nil)
+                        .help(change.isSubmodule ? "Open this submodule as a repository to discard its individual files" : "Discard changes to this item")
                         if change.isStaged { Text("STAGED").font(.caption2.weight(.bold)).foregroundStyle(.blue) }
                     }
                     .padding(.vertical, 2)
@@ -1431,7 +1473,22 @@ struct ChangeSection: View {
                 store.refresh()
             }
         }
-        .onChange(of: repository.path) { _, _ in showingGitignore = false }
+        .confirmationDialog("Discard this item?", isPresented: Binding(
+            get: { discardRequest != nil }, set: { if !$0 { discardRequest = nil } }
+        ), titleVisibility: .visible) {
+            if let request = discardRequest {
+                Button(request.change.isUntracked ? "Move to Trash" : "Discard Changes", role: .destructive) {
+                    store.discardChanges(request)
+                    discardRequest = nil
+                }
+            }
+            Button("Cancel", role: .cancel) { discardRequest = nil }
+        } message: {
+            if let request = discardRequest {
+                Text("\(request.change.path)\n\(request.repository.path.path)\n\n\(request.explanation)")
+            }
+        }
+        .onChange(of: repository.path) { _, _ in showingGitignore = false; discardRequest = nil }
     }
 
     private func changeLabel(_ change: GitFileChange) -> String {
@@ -1441,6 +1498,7 @@ struct ChangeSection: View {
 }
 
 struct BranchSection: View {
+    @State private var branchToDelete: BranchTrackingStatus?
     @EnvironmentObject private var store: RepositoryStore
     let repository: RepositorySnapshot
 
@@ -1491,16 +1549,16 @@ struct BranchSection: View {
                                 }
                                 if branch.canCleanUpSafely {
                                     Button(role: .destructive) {
-                                        store.cleanupBranch(repository: repository, branch: branch)
+                                        branchToDelete = branch
                                     } label: {
-                                        Label("Clean Up", systemImage: "trash")
+                                        Label("Delete", systemImage: "trash")
                                     }
                                     .buttonStyle(.bordered)
                                     .buttonBorderShape(.capsule)
                                     .controlSize(.small)
                                     .tint(.orange)
                                     .disabled(store.isRefreshing || store.isCleaningBranches || store.isRemovingWorktree)
-                                    .help("Safely delete this local branch; unmerged or checked-out branches are preserved")
+                                    .help("Delete this local branch after confirmation, including unmerged commits")
                                 }
                             }
                         }
@@ -1511,6 +1569,21 @@ struct BranchSection: View {
                 }
             }
         }
+        .confirmationDialog("Delete local branch?", isPresented: Binding(
+            get: { branchToDelete != nil },
+            set: { if !$0 { branchToDelete = nil } }
+        ), titleVisibility: .visible) {
+            if let branch = branchToDelete {
+                Button("Delete Branch", role: .destructive) {
+                    store.cleanupBranch(repository: repository, branch: branch, force: true)
+                    branchToDelete = nil
+                }
+            }
+            Button("Cancel", role: .cancel) { branchToDelete = nil }
+        } message: {
+            Text("Delete \(branchToDelete?.name ?? "") from \(repository.path.path)? Unmerged commits may be lost. Branches checked out in a worktree cannot be deleted.")
+        }
+        .onChange(of: repository.path) { _, _ in branchToDelete = nil }
     }
 }
 

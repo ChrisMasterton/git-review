@@ -14,11 +14,15 @@ struct WorktreeRemovalSheet: View {
                 .font(.callout.monospaced())
                 .textSelection(.enabled)
                 .fixedSize(horizontal: false, vertical: true)
-            Text("This permanently deletes the checkout folder, including ignored files, and removes its worktree registration. If the folder is already missing, only its registration is removed.")
+            Text("This permanently deletes the checkout folder, including uncommitted, untracked and ignored files, and removes its worktree registration. If the folder is already missing, only its registration is removed.")
                 .font(.callout)
+            if !checkout.changes.isEmpty {
+                Text("This also discards \(checkout.changes.count) uncommitted item(s), including \(checkout.changes.prefix(3).map(\.path).joined(separator: ", ")).")
+                    .font(.callout).foregroundStyle(.orange)
+            }
             Text(checkout.worktree.isDetached
-                 ? "The detached commit must be reachable from an existing branch or tag. Git will refuse dirty or locked worktrees."
-                 : "The local branch and its commits are kept. Git will refuse dirty or locked worktrees.")
+                 ? "Detached commits without a branch or tag may be lost. Locked worktrees cannot be removed."
+                 : "The local branch and its commits are kept. Locked worktrees cannot be removed.")
                 .font(.callout).foregroundStyle(.secondary)
             HStack {
                 Button("Cancel", role: .cancel) { store.worktreeToRemove = nil }

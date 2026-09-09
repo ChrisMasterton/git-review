@@ -280,7 +280,7 @@ enum RepositoryScanner {
             return CheckoutInspection(worktree: worktree, status: status, isUnavailable: true,
                                       error: reason, commitFields: [], checkoutDates: [:])
         }
-        let rawStatus = command.run(prefix + ["status", "--porcelain=v2", "--branch", "--untracked-files=normal"])
+        let rawStatus = command.run(prefix + ["status", "--porcelain=v2", "-z", "--branch", "--untracked-files=normal"])
         let parsed = GitStatusParser.parse(rawStatus.output)
         let commit = command.run(prefix + ["log", "-1", "--format=%h%x09%ar%x09%s"])
         let reflog = command.run(prefix + ["reflog", "show", "--date=unix", "--format=%gD%x09%gs", "HEAD"])

@@ -308,18 +308,15 @@ func refusesWorktreeThatChangesAfterReview(_ change: String) async throws {
     #expect(FileManager.default.fileExists(atPath: fixture.main.path))
 }
 
-@Test func preservesDetachedCommitsWithoutAnyRetainingRef() async throws {
+@Test func removesDetachedWorktreeWithoutRetainingRef() async throws {
     let fixture = try GitFixture()
     let target = try fixture.addWorktree("external/detached")
     try fixture.git(["-C", target.path, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Unreferenced commit"])
     let snapshots = await RepositoryScanner.scan(roots: [fixture.watched], fetchRemotes: false)
     let checkout = try #require(snapshots.first { $0.path.path == target.path })
-    #expect(throws: CommitFlowError.self) { try WorktreeRemoval.remove(checkout) }
-    #expect(FileManager.default.fileExists(atPath: target.path))
-    try fixture.git(["-C", target.path, "branch", "rescue"])
     _ = try WorktreeRemoval.remove(checkout)
     #expect(!FileManager.default.fileExists(atPath: target.path))
-    #expect(try fixture.git(["-C", fixture.main.path, "rev-parse", "rescue"]) == checkout.worktree.head)
+
 }
 
 @Test @MainActor func removalRequiresAConfirmationRequestAndCanBeCancelled() async throws {

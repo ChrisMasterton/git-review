@@ -3,11 +3,33 @@ import SwiftUI
 struct WorktreeSection: View {
     @EnvironmentObject private var store: RepositoryStore
     let group: RepositoryGroup
+    @State private var showMissing = false
+    @State private var cleanupTargets: [RepositorySnapshot] = []
+    private var missing: [RepositorySnapshot] { group.worktrees.filter { $0.path != group.path && $0.hasMissingDirectory } }
+    private var visible: [RepositorySnapshot] { group.worktrees.filter { showMissing || $0.path == group.path || !$0.hasMissingDirectory } }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Worktrees (\(group.worktrees.count))").font(.headline)
-            ForEach(group.worktrees) { checkout in
+            if !missing.isEmpty {
+                HStack {
+                    Button {
+                        showMissing.toggle()
+                    } label: {
+                        Label("\(missing.count) missing folders · 0 B checkout files", systemImage: showMissing ? "chevron.down" : "chevron.right")
+                    }
+                    .buttonStyle(.plain)
+                    Spacer()
+                    Button("Clear Missing…") {
+                        cleanupTargets = missing.filter { WorktreeRemoval.disabledReason(for: $0) == nil }
+                    }
+                    .disabled(!store.canRequestWorktreeRemoval || missing.allSatisfy { WorktreeRemoval.disabledReason(for: $0) != nil })
+                }
+                .font(.caption).foregroundStyle(.secondary)
+                Text("These folders are already gone. Clear their stale Git registrations in one step.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(visible) { checkout in
                 HStack(alignment: .top, spacing: 12) {
                     Button { store.select(checkout.id) } label: {
                         HStack(alignment: .top, spacing: 10) {
@@ -40,6 +62,7 @@ struct WorktreeSection: View {
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("Inspect \(checkout.branch) at \(checkout.path.path), \(checkout.checkoutStatusLabel)")
+                    WorktreeDiskUsageLabel(path: checkout.path)
                     Menu {
                         Button("Open Terminal") { store.openTerminal(checkout) }
                             .disabled(!checkout.canAccessCheckout)
@@ -66,5 +89,18 @@ struct WorktreeSection: View {
                 )
             }
         }
+        .confirmationDialog("Clear missing worktree registrations?", isPresented: Binding(
+            get: { !cleanupTargets.isEmpty },
+            set: { if !$0 { cleanupTargets = [] } }
+        ), titleVisibility: .visible) {
+            Button("Clear Missing Registrations", role: .destructive) {
+                store.clearMissingWorktrees(cleanupTargets)
+                cleanupTargets = []
+            }
+            Button("Cancel", role: .cancel) { cleanupTargets = [] }
+        } message: {
+            Text("Clear stale worktree registrations from \(group.path.path)? Git rechecks all registrations in this repository and prunes stale metadata only. Checkout folders are never deleted and locked registrations are kept. Detached commits without a branch or tag may be lost.")
+        }
+        .onChange(of: group.id) { _, _ in showMissing = false; cleanupTargets = [] }
     }
 }

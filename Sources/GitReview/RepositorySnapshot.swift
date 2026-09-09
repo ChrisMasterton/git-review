@@ -41,6 +41,7 @@ struct RepositorySnapshot: Identifiable, Equatable, Sendable {
     let fetchError: String?
     let statusError: String?
 
+    var hasMissingDirectory: Bool { CheckoutFolder.isMissing(path) }
     var id: String { path.path }
     var name: String { path.lastPathComponent }
     var relativePath: String {
@@ -122,7 +123,8 @@ struct RepositoryGroup: Identifiable, Sendable {
     var path: URL { primary.repositoryPath }
     var actionCheckout: RepositorySnapshot { worktrees.first(where: \.canAccessCheckout) ?? primary }
     var preferredCheckout: RepositorySnapshot {
-        worktrees.first(where: \.checkoutNeedsAttention) ?? primary
+        worktrees.first { $0.canAccessCheckout && $0.checkoutNeedsAttention }
+            ?? worktrees.first(where: \.canAccessCheckout) ?? primary
     }
     var needsAttention: Bool { worktrees.contains(where: \.needsAttention) }
     var isClean: Bool { !needsAttention }

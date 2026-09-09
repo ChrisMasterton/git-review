@@ -6,19 +6,25 @@ public struct GitFileChange: Equatable, Sendable {
     public let workTreeStatus: Character?
     public let isUntracked: Bool
     public let isConflicted: Bool
+    public let originalPath: String?
+    public let isSubmodule: Bool
 
     public init(
         path: String,
         indexStatus: Character?,
         workTreeStatus: Character?,
         isUntracked: Bool = false,
-        isConflicted: Bool = false
+        isConflicted: Bool = false,
+        originalPath: String? = nil,
+        isSubmodule: Bool = false
     ) {
         self.path = path
         self.indexStatus = indexStatus
         self.workTreeStatus = workTreeStatus
         self.isUntracked = isUntracked
         self.isConflicted = isConflicted
+        self.originalPath = originalPath
+        self.isSubmodule = isSubmodule
     }
 
     public var isStaged: Bool {
@@ -59,6 +65,7 @@ public enum GitStatusParser {
     }
 
     public static func parse(_ output: String) -> ParsedGitStatus {
+        if output.contains("\0") { return parseZeroSeparated(output) }
         var result = ParsedGitStatus()
 
         for rawLine in output.split(separator: "\n", omittingEmptySubsequences: true) {
@@ -108,6 +115,38 @@ public enum GitStatusParser {
 
         return result
     }
+    private static func parseZeroSeparated(_ output: String) -> ParsedGitStatus {
+        var result = ParsedGitStatus()
+        let records = output.split(separator: "\0", omittingEmptySubsequences: true).map(String.init)
+        var index = 0
+        while index < records.count {
+            let record = records[index]
+            index += 1
+            if record.hasPrefix("# ") {
+                let parsed = parse(record)
+                if record.hasPrefix("# branch.head ") { result.branch = parsed.branch }
+                if record.hasPrefix("# branch.upstream ") { result.upstream = parsed.upstream }
+                if record.hasPrefix("# branch.ab ") { result.ahead = parsed.ahead; result.behind = parsed.behind }
+                continue
+            }
+            if record.hasPrefix("? ") {
+                result.changes.append(GitFileChange(path: String(record.dropFirst(2)), indexStatus: nil, workTreeStatus: nil, isUntracked: true))
+                continue
+            }
+            let renamed = record.hasPrefix("2 ")
+            let conflicted = record.hasPrefix("u ")
+            guard renamed || conflicted || record.hasPrefix("1 ") else { continue }
+            let count = renamed ? 9 : conflicted ? 10 : 8
+            let fields = record.split(separator: " ", maxSplits: count, omittingEmptySubsequences: true)
+            guard fields.count == count + 1 else { continue }
+            var original: String?
+            if renamed && index < records.count { original = records[index]; index += 1 }
+            let xy = String(fields[1])
+            result.changes.append(GitFileChange(path: String(fields[count]), indexStatus: xy.first, workTreeStatus: xy.dropFirst().first, isConflicted: conflicted, originalPath: original, isSubmodule: fields[2].hasPrefix("S")))
+        }
+        return result
+    }
+
 }
 
 public struct BranchTrackingStatus: Equatable, Sendable {
