@@ -15,7 +15,7 @@ It follows the same lightweight SwiftUI approach as Container Review: no third-p
 - Commits behind the current branch's upstream. Repositories whose current branch is behind count as needing attention with a "Behind remote" label.
 - Remote fetch failures, shown without hiding the local status result.
 - One-click cleanup for unpublished local branches and branches whose upstream is gone. Cleanup uses Git's safe delete and skips checked-out or unmerged branches rather than force-deleting work.
-- An assisted commit flow that generates an editable commit message from the selected repository's pending status and tracked diffs, then stages and commits all changes after confirmation.
+- A commit flow with manual writing or AI generation from compact change summaries, then staging and committing all changes after confirmation.
 - Separate Commit and Push actions, plus a fast-forward-only Pull action for clean working trees.
 - Inline branch actions: publish a local-only branch to `origin`, safely clean up an unpublished or stale branch, or push any tracked branch that is ahead without checking it out first.
 
@@ -33,7 +33,9 @@ Use **Discard…** beside a Working Tree item for a quick cleanup. Tracked items
 
 Export either `openrouter_api_key` or `OPENROUTER_API_KEY` in your shell configuration (for example, `~/.zshrc`) or set it in the environment used to launch Git Review. Apps opened from Finder or the Dock do not inherit Terminal's shell exports, so when no key is inherited, Git Review reads the OpenRouter settings from your interactive login shell. This lookup runs in the background with a five-second timeout and keeps the values in memory. Inherited app settings take precedence. `openrouter_model` or `OPENROUTER_MODEL` can optionally override the default `openrouter/auto` model. The shell fallback is checked on each generation attempt, so changes to shell exports can be picked up by retrying.
 
-The Commit button first asks for permission to send data. Git Review redacts common credential formats, caps the request payload, and sends tracked diffs plus status information; untracked file contents are not sent. The generated message remains editable. Before staging anything, the app verifies that the working change set still matches the one used to generate the message, protecting against another agent changing the repository during review.
+The Commit button offers **Write Manually** (no API key or network request) and **Generate with AI**. AI generation sends a redacted prompt capped at 12,000 characters: file paths, added/removed line counts, and selected diff excerpts capped at 1,200 characters per file and 6,000 in total. New, deleted, and untracked file contents are omitted, including unstaged edits to newly staged files. Large file lists and excerpts are explicitly marked as shortened. The generated message remains editable. Requests do not stream and allow 4,096 completion tokens with minimal reasoning; an output-limit error still rejects the incomplete message and points to manual writing.
+
+Full tracked diffs are read and fingerprinted locally, independently of the smaller AI summary. Before staging anything, both manual and AI flows verify that the working change set still matches the draft, protecting against another agent changing the repository during review. Run `scripts/check-commit-flows.sh` for local commit-flow smoke coverage without Swift Testing or OpenRouter credentials.
 
 Push publishes existing commits from the current branch without staging or committing working-tree changes. It uses the existing branch remote when configured and creates an `origin` upstream for a new local branch. A local-only branch listed under Branches Needing Attention can also be published directly without checking it out. Pull is available only for clean working trees and runs with `--ff-only`, so it never creates an implicit merge commit.
 

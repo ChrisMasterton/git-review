@@ -9,7 +9,7 @@ import Testing
     let reasoning = try #require(json["reasoning"] as? [String: Any])
 
     #expect(json["stream"] as? Bool == false)
-    #expect(json["max_completion_tokens"] as? Int == 800)
+    #expect(json["max_completion_tokens"] as? Int == 4_096)
     #expect(json["max_tokens"] == nil)
     #expect(reasoning["effort"] as? String == "minimal")
     #expect(reasoning["exclude"] as? Bool == true)

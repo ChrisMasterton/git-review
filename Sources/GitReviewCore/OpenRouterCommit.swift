@@ -27,7 +27,7 @@ public struct OpenRouterCommitRequest: Encodable, Sendable {
         self.model = model
         messages = [Message(role: "user", content: prompt)]
         temperature = 0.2
-        maxCompletionTokens = 800
+        maxCompletionTokens = 4_096
         reasoning = Reasoning(effort: "minimal", exclude: true)
         stream = false
     }
@@ -46,7 +46,7 @@ public enum OpenRouterCommitResponseError: LocalizedError, Equatable, Sendable {
     public var errorDescription: String? {
         switch self {
         case .outputTruncated:
-            return "OpenRouter reached its output limit before finishing the commit message. Generate the message again."
+            return "OpenRouter reached its output limit before finishing the commit message. Try again, or choose Commit → Write Manually to write it yourself."
         case .missingMessage:
             return "OpenRouter returned no commit message."
         case let .service(message):
