@@ -1388,11 +1388,21 @@ struct MetadataColumn: View {
 }
 
 struct ChangeSection: View {
+    @EnvironmentObject private var store: RepositoryStore
+    @State private var showingGitignore = false
+    @State private var directoryToIgnore: String?
     let repository: RepositorySnapshot
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Working Tree").font(.headline)
+            HStack {
+                Text("Working Tree").font(.headline)
+                Spacer()
+                Button("Edit .gitignore…") {
+                    directoryToIgnore = nil
+                    showingGitignore = true
+                }
+            }
             if repository.changes.isEmpty {
                 EmptyLine(symbol: "checkmark.circle", text: "No uncommitted files", color: .green)
             } else {
@@ -1404,12 +1414,24 @@ struct ChangeSection: View {
                             .frame(width: 24, alignment: .leading)
                         Text(change.path).font(.callout.monospaced()).lineLimit(1).truncationMode(.middle)
                         Spacer()
+                        if change.isUntracked && change.path.hasSuffix("/") {
+                            Button("Add to .gitignore…") {
+                                directoryToIgnore = change.path
+                                showingGitignore = true
+                            }
+                        }
                         if change.isStaged { Text("STAGED").font(.caption2.weight(.bold)).foregroundStyle(.blue) }
                     }
                     .padding(.vertical, 2)
                 }
             }
         }
+        .sheet(isPresented: $showingGitignore) {
+            GitignoreEditor(root: repository.path, directory: directoryToIgnore) {
+                store.refresh()
+            }
+        }
+        .onChange(of: repository.path) { _, _ in showingGitignore = false }
     }
 
     private func changeLabel(_ change: GitFileChange) -> String {
