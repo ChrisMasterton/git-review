@@ -1,4 +1,5 @@
 import Foundation
+import GitReviewCore
 import Testing
 @testable import GitReview
 
@@ -43,5 +44,187 @@ private final class CommitFixture {
     #expect(before.fingerprint != after.fingerprint)
     #expect(throws: CommitFlowError.self) {
         try CommitService.commit(repository: repository, message: "Add feature", expectedFingerprint: before.fingerprint)
+    }
+}
+
+@Test(arguments: ["simple", "matching"])
+func currentBranchPushTargetsOnlyItsConfiguredUpstream(_ pushDefault: String) async throws {
+    let fixture = try CommitFixture()
+    let remote = fixture.root.appendingPathExtension("git")
+    defer { try? FileManager.default.removeItem(at: remote) }
+    try fixture.git(["commit", "--allow-empty", "-m", "Base"])
+    try fixture.git(["init", "--bare", remote.path])
+    try fixture.git(["remote", "add", "origin", remote.path])
+    try fixture.git(["push", "--set-upstream", "origin", "refs/heads/main:refs/heads/review-main"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["branch", "control"])
+    try fixture.git(["push", "origin", "refs/heads/control:refs/heads/control"])
+    try fixture.git(["checkout", "control"])
+    try fixture.git(["commit", "--allow-empty", "-m", "Keep local control"])
+    try fixture.git(["checkout", "main"])
+    try fixture.git(["commit", "--allow-empty", "-m", "Publish current branch"])
+    try fixture.git(["config", "push.default", pushDefault])
+    let expected = try fixture.git(["rev-parse", "HEAD"])
+    let repository = try await fixture.snapshot()
+    #expect(repository.currentBranchNeedsPush)
+
+    _ = try CommitService.push(repository: repository)
+
+    let published = try fixture.git(["--git-dir", remote.path, "rev-parse", "refs/heads/review-main"])
+    let control = try fixture.git(["--git-dir", remote.path, "rev-parse", "refs/heads/control"])
+    #expect(published == expected)
+    #expect(control == base)
+    let refreshed = try await fixture.snapshot()
+    #expect(refreshed.currentBranchTracking?.ahead == 0)
+    #expect(refreshed.branches.first { $0.name == "control" }?.canPublish == true)
+}
+
+@Test(arguments: [true, false])
+func inlinePushDisambiguatesBranchFromTagWithTheSameName(_ tracked: Bool) async throws {
+    let fixture = try CommitFixture()
+    let remote = fixture.root.appendingPathExtension("git")
+    defer { try? FileManager.default.removeItem(at: remote) }
+    try fixture.git(["commit", "--allow-empty", "-m", "Base"])
+    try fixture.git(["init", "--bare", remote.path])
+    try fixture.git(["remote", "add", "origin", remote.path])
+    if tracked {
+        try fixture.git(["push", "--set-upstream", "origin", "refs/heads/main:refs/heads/main"])
+    } else {
+        try fixture.git(["push", "origin", "refs/heads/main:refs/heads/published-base"])
+    }
+    try fixture.git(["tag", "main"])
+    let tag = try fixture.git(["rev-parse", "refs/tags/main"])
+    try fixture.git(["commit", "--allow-empty", "-m", "Advance branch"])
+    let expected = try fixture.git(["rev-parse", "HEAD"])
+    let repository = try await fixture.snapshot()
+    let branch = try #require(repository.currentBranchTracking)
+    #expect(branch.name == "main")
+    #expect(branch.canPublish == !tracked)
+
+    _ = try BranchActionService.push(repository: repository, branch: branch)
+
+    let published = try fixture.git(["--git-dir", remote.path, "rev-parse", "refs/heads/main"])
+    #expect(published == expected)
+    #expect(try fixture.git(["rev-parse", "refs/tags/main"]) == tag)
+    let refreshed = try await fixture.snapshot()
+    #expect(refreshed.currentBranchTracking?.upstream == "origin/main")
+    #expect(!refreshed.currentBranchNeedsPush)
+}
+
+@Test func currentBranchPushRefusesAnExternalBranchSwitchAfterScanning() async throws {
+    let fixture = try CommitFixture()
+    let remote = fixture.root.appendingPathExtension("git")
+    defer { try? FileManager.default.removeItem(at: remote) }
+    try fixture.git(["commit", "--allow-empty", "-m", "Base"])
+    try fixture.git(["init", "--bare", remote.path])
+    try fixture.git(["remote", "add", "origin", remote.path])
+    try fixture.git(["push", "--set-upstream", "origin", "refs/heads/main:refs/heads/main"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["commit", "--allow-empty", "-m", "Intended push"])
+    let repository = try await fixture.snapshot()
+    try fixture.git(["checkout", "--no-track", "-b", "private-work"])
+
+    #expect(throws: CommitFlowError.self) {
+        try CommitService.push(repository: repository)
+    }
+
+    #expect(try fixture.git(["--git-dir", remote.path, "rev-parse", "refs/heads/main"]) == base)
+    #expect(try fixture.git(["--git-dir", remote.path, "for-each-ref", "--format=%(refname)", "refs/heads"]) == "refs/heads/main")
+    #expect(try fixture.git(["symbolic-ref", "HEAD"]) == "refs/heads/private-work")
+}
+
+@Test func pullRefusesAnExternalBranchSwitchAfterScanning() async throws {
+    let fixture = try CommitFixture()
+    let remote = fixture.root.appendingPathExtension("git")
+    defer { try? FileManager.default.removeItem(at: remote) }
+    try fixture.write("file.txt", "Base\n")
+    try fixture.git(["add", "file.txt"])
+    try fixture.git(["commit", "-m", "Base"])
+    try fixture.git(["init", "--bare", remote.path])
+    try fixture.git(["remote", "add", "origin", remote.path])
+    try fixture.git(["push", "--set-upstream", "origin", "refs/heads/main:refs/heads/main"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["checkout", "-b", "other"])
+    try fixture.git(["push", "--set-upstream", "origin", "refs/heads/other:refs/heads/other"])
+    try fixture.write("file.txt", "Remote work\n")
+    try fixture.git(["commit", "-am", "Advance other branch"])
+    try fixture.git(["push", "origin", "refs/heads/other:refs/heads/other"])
+    let remoteTip = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["reset", "--hard", base])
+    try fixture.git(["checkout", "main"])
+    let repository = try await fixture.snapshot()
+    try fixture.git(["checkout", "other"])
+
+    #expect(throws: CommitFlowError.self) { try CommitService.pull(repository: repository) }
+
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent("file.txt"), encoding: .utf8) == "Base\n")
+    #expect(try fixture.git(["--git-dir", remote.path, "rev-parse", "refs/heads/other"]) == remoteTip)
+    // After refreshing the actual checkout, the ordinary fast-forward works.
+    let refreshed = try await fixture.snapshot()
+    _ = try CommitService.pull(repository: refreshed)
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == remoteTip)
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent("file.txt"), encoding: .utf8) == "Remote work\n")
+}
+
+@Test(arguments: [0, 1]) @MainActor
+func pendingCommitKeepsItsDraftUntilGitFinishes(_ hookExitCode: Int) async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("file.txt", "Submitted content\n")
+    let repository = try await fixture.snapshot()
+    let context = try CommitService.context(for: repository)
+    let hooks = fixture.root.appendingPathComponent(".git/hooks")
+    let release = fixture.root.appendingPathComponent(".git/commit-release")
+    let started = fixture.root.appendingPathComponent(".git/commit-started")
+    let hook = hooks.appendingPathComponent("pre-commit")
+    try """
+    #!/bin/sh
+    touch .git/commit-started
+    attempts=0
+    while [ ! -f .git/commit-release ] && [ "$attempts" -lt 500 ]; do
+        sleep 0.02
+        attempts=$((attempts + 1))
+    done
+    [ -f .git/commit-release ] || exit 2
+    exit \(hookExitCode)
+    """.write(to: hook, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+    try fixture.git(["config", "core.hooksPath", hooks.path])
+    defer { try? Data().write(to: release) }
+    let store = RepositoryStore()
+    store.roots = []
+    store.commitDraft = CommitDraft(repository: repository, fingerprint: context.fingerprint, model: "Manual", summary: "Fixture")
+    store.commitMessage = "Save submitted message"
+    store.commitDraftMessage()
+    for _ in 0..<500 {
+        if FileManager.default.fileExists(atPath: started.path) { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(FileManager.default.fileExists(atPath: started.path))
+    #expect(store.isCommitting)
+
+    // The sheet's Cancel button and Escape call this same action.
+    store.cancelCommitDraft()
+    #expect(store.commitDraft?.repository.id == repository.id)
+    #expect(store.commitMessage == "Save submitted message")
+
+    try Data().write(to: release)
+    for _ in 0..<500 {
+        if !store.isCommitting { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(!store.isCommitting)
+    if hookExitCode == 0 {
+        #expect(store.commitFlowError == nil)
+        #expect(store.commitDraft == nil)
+        #expect(try fixture.git(["log", "-1", "--format=%B"]) == "Save submitted message")
+        #expect(try fixture.git(["show", "HEAD:file.txt"]) == "Submitted content")
+        #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+    } else {
+        #expect(store.commitFlowError != nil)
+        #expect(store.commitDraft?.repository.id == repository.id)
+        #expect(store.commitMessage == "Save submitted message")
+        store.cancelCommitDraft()
+        #expect(store.commitDraft == nil && store.commitMessage.isEmpty)
     }
 }

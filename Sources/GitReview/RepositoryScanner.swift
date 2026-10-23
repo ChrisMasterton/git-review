@@ -201,7 +201,7 @@ enum RepositoryScanner {
         }
         let rawBranches = command.run(prefix + [
             "for-each-ref",
-            "--format=%(refname:short)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:unix)",
+            "--format=%(refname:lstrip=2)%09%(upstream:short)%09%(upstream:track)%09%(committerdate:unix)",
             "refs/heads"
         ])
         let parsedBranches = rawBranches.exitCode == 0 ? BranchTrackingParser.parse(rawBranches.output) : []
@@ -219,7 +219,7 @@ enum RepositoryScanner {
         let branches = parsedBranches.map { branch in
             let isPublishedWithoutUpstream: Bool
             if branch.upstream == nil {
-                let containingRemotes = command.run(prefix + ["branch", "--remotes", "--contains", branch.name])
+                let containingRemotes = command.run(prefix + ["branch", "--remotes", "--contains", "refs/heads/\(branch.name)"])
                 isPublishedWithoutUpstream = containingRemotes.exitCode == 0 && !containingRemotes.output.isEmpty
             } else {
                 isPublishedWithoutUpstream = branch.isPublishedWithoutUpstream
@@ -227,7 +227,7 @@ enum RepositoryScanner {
             let creationDate: Date?
             if branch.upstreamGone {
                 let branchReflog = command.run(prefix + [
-                    "reflog", "show", "--date=unix", "--format=%gD%x09%gs", branch.name
+                    "reflog", "show", "--date=unix", "--format=%gD%x09%gs", "refs/heads/\(branch.name)"
                 ])
                 creationDate = branchReflog.exitCode == 0
                     ? BranchActivityParser.approximateCreationDate(branchReflog.output) : nil

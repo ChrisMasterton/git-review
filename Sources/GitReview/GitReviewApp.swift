@@ -239,6 +239,7 @@ enum CommitService {
         guard status.output.isEmpty else {
             throw CommitFlowError.command("Commit or discard local changes before pulling. Nothing was changed.")
         }
+        _ = try currentBranch(for: repository)
         let pull = GitCommand.run(prefix + ["pull", "--ff-only"])
         guard pull.exitCode == 0 else {
             throw CommitFlowError.command(pull.error.isEmpty ? "Fast-forward pull failed." : pull.error)
@@ -248,29 +249,20 @@ enum CommitService {
 
     static func push(repository: RepositorySnapshot) throws -> String {
         try requireCheckout(repository)
+        let branchName = try currentBranch(for: repository)
+        return try BranchActionService.push(repository: repository, branchName: branchName)
+    }
+
+    private static func currentBranch(for repository: RepositorySnapshot) throws -> String {
         let prefix = ["-C", repository.path.path]
-        let branchResult = GitCommand.run(prefix + ["symbolic-ref", "--quiet", "--short", "HEAD"])
-        guard branchResult.exitCode == 0, !branchResult.output.isEmpty else {
-            throw CommitFlowError.command("Cannot push from a detached HEAD.")
+        let branchResult = GitCommand.run(prefix + ["symbolic-ref", "--quiet", "HEAD"])
+        guard branchResult.exitCode == 0, branchResult.output.hasPrefix("refs/heads/") else {
+            throw CommitFlowError.command("Cannot pull or push from a detached HEAD.")
         }
-
-        let configuredRemote = GitCommand.run(prefix + ["config", "--get", "branch.\(branchResult.output).remote"])
-        let arguments: [String]
-        if configuredRemote.exitCode == 0, !configuredRemote.output.isEmpty {
-            arguments = prefix + ["push"]
-        } else {
-            let origin = GitCommand.run(prefix + ["remote", "get-url", "origin"])
-            guard origin.exitCode == 0, !origin.output.isEmpty else {
-                throw CommitFlowError.command("No upstream or origin remote is configured for \(branchResult.output).")
-            }
-            arguments = prefix + ["push", "--set-upstream", "origin", branchResult.output]
+        guard branchResult.output == "refs/heads/\(repository.branch)" else {
+            throw CommitFlowError.command("The checkout's branch changed since it was scanned. Refresh before pulling or pushing. Nothing was changed.")
         }
-
-        let push = GitCommand.run(arguments)
-        guard push.exitCode == 0 else {
-            throw CommitFlowError.command(push.error.isEmpty ? "Git push failed." : push.error)
-        }
-        return "pushed \(branchResult.output)"
+        return String(branchResult.output.dropFirst("refs/heads/".count))
     }
 
     private static func cleanCommitMessage(_ value: String) -> String {
@@ -372,40 +364,46 @@ enum BranchActionService {
     }
 
     static func push(repository: RepositorySnapshot, branch: BranchTrackingStatus) throws -> String {
-        try CommitService.requireCheckout(repository)
         guard branch.canPublish || branch.canPush else {
             throw CommitFlowError.command("\(branch.name) has no commits waiting to be pushed.")
         }
+        return try push(repository: repository, branchName: branch.name)
+    }
+
+    /// Both Push surfaces target one explicit branch, independently of
+    /// push.default, remote push refspecs, or tags with the same name.
+    fileprivate static func push(repository: RepositorySnapshot, branchName: String) throws -> String {
+        try CommitService.requireCheckout(repository)
         let prefix = ["-C", repository.path.path]
-        if branch.canPublish {
+        let source = "refs/heads/\(branchName)"
+        let remoteResult = GitCommand.run(prefix + ["config", "--get", "branch.\(branchName).remote"])
+        if remoteResult.exitCode != 0 || remoteResult.output.isEmpty {
             let origin = GitCommand.run(prefix + ["remote", "get-url", "origin"])
             guard origin.exitCode == 0, !origin.output.isEmpty else {
-                throw CommitFlowError.command("No origin remote is configured for \(branch.name).")
+                throw CommitFlowError.command("No origin remote is configured for \(branchName).")
             }
             let result = GitCommand.run(prefix + [
-                "push", "--set-upstream", "origin", branch.name
+                "push", "--set-upstream", "origin", "\(source):\(source)"
             ])
             guard result.exitCode == 0 else {
-                throw CommitFlowError.command(result.error.isEmpty ? "Git push failed for \(branch.name)." : result.error)
+                throw CommitFlowError.command(result.error.isEmpty ? "Git push failed for \(branchName)." : result.error)
             }
-            return "Published \(branch.name) to origin/\(branch.name)"
+            return "Published \(branchName) to origin/\(branchName)"
         }
 
-        let remoteResult = GitCommand.run(prefix + ["config", "--get", "branch.\(branch.name).remote"])
-        let mergeResult = GitCommand.run(prefix + ["config", "--get", "branch.\(branch.name).merge"])
-        guard remoteResult.exitCode == 0, !remoteResult.output.isEmpty,
-              mergeResult.exitCode == 0, mergeResult.output.hasPrefix("refs/heads/") else {
-            throw CommitFlowError.command("No usable upstream is configured for \(branch.name).")
+        let mergeResult = GitCommand.run(prefix + ["config", "--get", "branch.\(branchName).merge"])
+        guard mergeResult.exitCode == 0, mergeResult.output.hasPrefix("refs/heads/") else {
+            throw CommitFlowError.command("No usable upstream is configured for \(branchName).")
         }
 
         let remoteBranch = String(mergeResult.output.dropFirst("refs/heads/".count))
         let result = GitCommand.run(prefix + [
-            "push", remoteResult.output, "\(branch.name):\(remoteBranch)"
+            "push", remoteResult.output, "\(source):\(mergeResult.output)"
         ])
         guard result.exitCode == 0 else {
-            throw CommitFlowError.command(result.error.isEmpty ? "Git push failed for \(branch.name)." : result.error)
+            throw CommitFlowError.command(result.error.isEmpty ? "Git push failed for \(branchName)." : result.error)
         }
-        return "Pushed \(branch.name) to \(remoteResult.output)/\(remoteBranch)"
+        return "Pushed \(branchName) to \(remoteResult.output)/\(remoteBranch)"
     }
 }
 
@@ -455,17 +453,19 @@ final class RepositoryStore: ObservableObject {
     @Published var statusText = "Add a folder to begin"
     @Published var lastRefreshed: Date?
     @Published var fetchRemotes: Bool {
-        didSet { UserDefaults.standard.set(fetchRemotes, forKey: Self.fetchKey) }
+        didSet { defaults.set(fetchRemotes, forKey: Self.fetchKey) }
     }
 
     private static let rootsKey = "repositoryRoots"
     private static let fetchKey = "fetchRemotes"
+    private let defaults: UserDefaults
     private var autoRefreshTask: Task<Void, Never>?
 
-    init() {
-        roots = (UserDefaults.standard.stringArray(forKey: Self.rootsKey) ?? [])
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        roots = (defaults.stringArray(forKey: Self.rootsKey) ?? [])
             .map { URL(fileURLWithPath: $0).standardizedFileURL }
-        fetchRemotes = UserDefaults.standard.object(forKey: Self.fetchKey) as? Bool ?? true
+        fetchRemotes = defaults.object(forKey: Self.fetchKey) as? Bool ?? true
     }
 
     deinit { autoRefreshTask?.cancel() }
@@ -559,12 +559,16 @@ final class RepositoryStore: ObservableObject {
         let shouldFetch = fetchRemotes
         Task {
             let next = await RepositoryScanner.scan(roots: rootsToScan, fetchRemotes: shouldFetch)
+            isRefreshing = false
+            guard roots == rootsToScan else {
+                refresh()
+                return
+            }
             repositories = next
             if let selectedRepositoryID, !next.contains(where: { $0.id == selectedRepositoryID }) {
                 self.selectedRepositoryID = nil
             }
             lastRefreshed = Date()
-            isRefreshing = false
             if next.isEmpty {
                 statusText = "No Git repositories found"
             } else if attentionCount == 0 {
@@ -662,6 +666,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     func cancelCommitDraft() {
+        guard !isCommitting else { return }
         commitDraft = nil
         commitMessage = ""
     }
@@ -890,7 +895,7 @@ final class RepositoryStore: ObservableObject {
     }
 
     private func persistRoots() {
-        UserDefaults.standard.set(roots.map(\.path), forKey: Self.rootsKey)
+        defaults.set(roots.map(\.path), forKey: Self.rootsKey)
     }
 
     private func branchActionID(repository: RepositorySnapshot, branch: BranchTrackingStatus) -> String {
@@ -1373,6 +1378,7 @@ struct CommitDraftSheet: View {
 
             TextEditor(text: $store.commitMessage)
                 .font(.body.monospaced())
+                .disabled(store.isCommitting)
                 .scrollContentBackground(.hidden)
                 .padding(10)
                 .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 8))
@@ -1391,6 +1397,7 @@ struct CommitDraftSheet: View {
             HStack {
                 Button("Cancel", role: .cancel) { store.cancelCommitDraft() }
                     .keyboardShortcut(.cancelAction)
+                    .disabled(store.isCommitting)
                 Spacer()
                 Button("Commit Changes") {
                     store.commitDraftMessage()

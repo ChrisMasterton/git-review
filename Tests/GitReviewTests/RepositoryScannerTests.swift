@@ -230,6 +230,40 @@ private final class CommandRecorder: @unchecked Sendable {
     #expect(Set(dirty.map(\.id)) == Set(clean.map(\.id)))
 }
 
+@Test(arguments: [true, false]) @MainActor
+func stoppingWatchingDuringRefreshCannotRestoreRemovedRepositories(_ removeAll: Bool) async throws {
+    let removed = try GitFixture()
+    let retained = try GitFixture()
+    try removed.dirty(removed.main)
+    try retained.dirty(retained.main)
+    let suiteName = "git-review-refresh-tests-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    defaults.set((removeAll ? [removed.watched] : [removed.watched, retained.watched]).map(\.path), forKey: "repositoryRoots")
+    defaults.set(false, forKey: "fetchRemotes")
+    let store = RepositoryStore(defaults: defaults)
+    store.repositories = await RepositoryScanner.scan(roots: store.roots, fetchRemotes: false)
+    store.select(removed.main.path)
+
+    store.refresh()
+    #expect(store.isRefreshing)
+    // This is the actual Stop Watching action. The first scan has captured
+    // its roots, and no main-actor suspension lets its completion race ahead.
+    store.removeRoot(removed.watched)
+    for _ in 0..<500 {
+        if !store.isRefreshing { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(!store.isRefreshing)
+    #expect(store.roots.map(\.path) == (removeAll ? [] : [retained.watched.path]))
+    #expect(store.repositories.map(\.path.path) == (removeAll ? [] : [retained.main.path]))
+    #expect(store.selectedRepositoryID == nil)
+    let reloaded = RepositoryStore(defaults: defaults)
+    #expect(reloaded.roots == store.roots)
+    #expect(!reloaded.fetchRemotes)
+    if removeAll { #expect(store.statusText == "Add a folder to begin") }
+}
+
 @Test func bulkCleanupRunsOncePerRepositoryAndPreservesCheckedOutBranches() async throws {
     let fixture = try GitFixture()
     let linked = try fixture.addWorktree("external/linked", branch: "feature/checked-out")
