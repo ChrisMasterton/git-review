@@ -46,7 +46,7 @@ struct CommitContext: Sendable {
 
 struct CommitDraft: Sendable {
     let repository: RepositorySnapshot
-    let fingerprint: String
+    var fingerprint: String
     let model: String
     let summary: String
 }
@@ -56,6 +56,7 @@ enum CommitFlowError: LocalizedError {
     case noChanges
     case changedSinceGeneration
     case changedWhileStaging
+    case commitRejected(String, retryFingerprint: String)
     case command(String)
     case invalidResponse(String)
 
@@ -69,7 +70,7 @@ enum CommitFlowError: LocalizedError {
             return "The repository changed after the commit draft was opened. Nothing was staged or committed. Refresh and open a new commit draft."
         case .changedWhileStaging:
             return "The repository changed while Git Review was staging files, so the commit was aborted rather than commit unverified edits. Nothing was committed; review the staged changes before committing manually."
-        case let .command(detail), let .invalidResponse(detail):
+        case let .commitRejected(detail, _), let .command(detail), let .invalidResponse(detail):
             return detail
         }
     }
@@ -91,6 +92,7 @@ enum CommitService {
 
     static func context(for repository: RepositorySnapshot) throws -> CommitContext {
         try requireCheckout(repository)
+        _ = try currentBranch(for: repository, allowDetached: true)
         let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
         let status = GitCommand.run(prefix + ["status", "--short", "--branch", "--untracked-files=all"])
         guard status.exitCode == 0 else {
@@ -222,9 +224,15 @@ enum CommitService {
         }
         guard !hasUnstagedRemainder else { throw CommitFlowError.changedWhileStaging }
 
+        // Staging changes the fingerprint even when the submitted files did not
+        // change. Retain this state for retries, before hooks can edit anything.
+        let retryFingerprint = try context(for: repository).fingerprint
         let commit = GitCommand.run(prefix + ["commit", "--message", trimmedMessage])
         guard commit.exitCode == 0 else {
-            throw CommitFlowError.command(commit.error.isEmpty ? "Git commit failed." : commit.error)
+            throw CommitFlowError.commitRejected(
+                commit.error.isEmpty ? "Git commit failed." : commit.error,
+                retryFingerprint: retryFingerprint
+            )
         }
         return commit.output.split(separator: "\n").first.map(String.init) ?? "Commit created"
     }
@@ -253,14 +261,20 @@ enum CommitService {
         return try BranchActionService.push(repository: repository, branchName: branchName)
     }
 
-    private static func currentBranch(for repository: RepositorySnapshot) throws -> String {
+    static func currentBranch(for repository: RepositorySnapshot, allowDetached: Bool = false) throws -> String {
         let prefix = ["-C", repository.path.path]
         let branchResult = GitCommand.run(prefix + ["symbolic-ref", "--quiet", "HEAD"])
-        guard branchResult.exitCode == 0, branchResult.output.hasPrefix("refs/heads/") else {
-            throw CommitFlowError.command("Cannot pull or push from a detached HEAD.")
+        if branchResult.exitCode == 1, repository.worktree.isDetached {
+            guard allowDetached else {
+                throw CommitFlowError.command("Cannot pull or push from a detached HEAD.")
+            }
+            let head = GitCommand.run(prefix + ["rev-parse", "--verify", "HEAD"])
+            if head.exitCode == 0, head.output == repository.worktree.head {
+                return repository.branch
+            }
         }
-        guard branchResult.output == "refs/heads/\(repository.branch)" else {
-            throw CommitFlowError.command("The checkout's branch changed since it was scanned. Refresh before pulling or pushing. Nothing was changed.")
+        guard branchResult.exitCode == 0, branchResult.output == "refs/heads/\(repository.branch)" else {
+            throw CommitFlowError.command("The checkout changed branches or detached commits since it was scanned. Refresh before taking this action. Nothing was changed.")
         }
         return String(branchResult.output.dropFirst("refs/heads/".count))
     }
@@ -692,6 +706,9 @@ final class RepositoryStore: ObservableObject {
                 isCommitting = false
                 refresh()
             } catch {
+                if case let CommitFlowError.commitRejected(_, retryFingerprint) = error {
+                    commitDraft?.fingerprint = retryFingerprint
+                }
                 commitFlowError = error.localizedDescription
                 statusText = "Commit failed"
                 isCommitting = false

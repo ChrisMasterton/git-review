@@ -224,7 +224,127 @@ func pendingCommitKeepsItsDraftUntilGitFinishes(_ hookExitCode: Int) async throw
         #expect(store.commitFlowError != nil)
         #expect(store.commitDraft?.repository.id == repository.id)
         #expect(store.commitMessage == "Save submitted message")
-        store.cancelCommitDraft()
-        #expect(store.commitDraft == nil && store.commitMessage.isEmpty)
+        // After resolving the hook failure, retry the retained draft directly.
+        try fixture.git(["config", "core.hooksPath", "/dev/null"])
+        store.commitFlowError = nil
+        store.commitDraftMessage()
+        for _ in 0..<500 {
+            if !store.isCommitting { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        try #require(!store.isCommitting)
+        #expect(store.commitFlowError == nil)
+        #expect(store.commitDraft == nil)
+        #expect(try fixture.git(["log", "-1", "--format=%B"]) == "Save submitted message")
+        #expect(try fixture.git(["show", "HEAD:file.txt"]) == "Submitted content")
+        #expect(try fixture.git(["rev-list", "--count", "HEAD"]) == "1")
+        #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
     }
+}
+
+@Test @MainActor func rejectedCommitDoesNotApproveEditsMadeByTheHook() async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.write("file.txt", "Submitted content\n")
+    let repository = try await fixture.snapshot()
+    let context = try CommitService.context(for: repository)
+    let hooks = fixture.root.appendingPathComponent(".git/hooks")
+    let hook = hooks.appendingPathComponent("pre-commit")
+    try """
+    #!/bin/sh
+    echo 'Unreviewed hook edits' > file.txt
+    git add file.txt
+    exit 1
+    """.write(to: hook, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+    try fixture.git(["config", "core.hooksPath", hooks.path])
+    let store = RepositoryStore()
+    store.roots = []
+    store.commitDraft = CommitDraft(repository: repository, fingerprint: context.fingerprint, model: "Manual", summary: "Fixture")
+    store.commitMessage = "Save submitted message"
+    store.commitDraftMessage()
+    for _ in 0..<500 {
+        if !store.isCommitting { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(!store.isCommitting && store.commitFlowError != nil)
+
+    try fixture.git(["config", "core.hooksPath", "/dev/null"])
+    store.commitFlowError = nil
+    store.commitDraftMessage()
+    for _ in 0..<500 {
+        if !store.isCommitting { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(!store.isCommitting)
+    #expect(store.commitFlowError == CommitFlowError.changedSinceGeneration.localizedDescription)
+    #expect(store.commitMessage == "Save submitted message")
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["show", ":file.txt"]) == "Unreviewed hook edits")
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent("control.txt"), encoding: .utf8) == "Keep this content\n")
+    store.cancelCommitDraft()
+    #expect(store.commitDraft == nil && store.commitMessage.isEmpty)
+}
+
+@Test(arguments: ["commit", "discard"])
+func fileActionsRefuseAnExternalBranchSwitchAfterScanning(_ action: String) async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("file.txt", "Base\n")
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["branch", "other"])
+    try fixture.write("file.txt", "Uncommitted content\n")
+    let repository = try await fixture.snapshot()
+    let change = try #require(repository.changes.first { $0.path == "file.txt" })
+    // Git carries the ordinary working-tree edit onto the other branch.
+    try fixture.git(["checkout", "other"])
+
+    #expect(throws: CommitFlowError.self) {
+        if action == "commit" {
+            let draft = try CommitService.context(for: repository)
+            _ = try CommitService.commit(repository: repository, message: "Save edit", expectedFingerprint: draft.fingerprint)
+        } else {
+            _ = try DiscardChanges.discard(repository: repository, change: change)
+        }
+    }
+
+    #expect(try fixture.git(["rev-parse", "refs/heads/main"]) == base)
+    #expect(try fixture.git(["rev-parse", "refs/heads/other"]) == base)
+    #expect(try fixture.git(["symbolic-ref", "HEAD"]) == "refs/heads/other")
+    #expect(try fixture.git(["show", ":file.txt"]) == "Base")
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent("file.txt"), encoding: .utf8) == "Uncommitted content\n")
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent("control.txt"), encoding: .utf8) == "Keep this content\n")
+}
+
+@Test(arguments: ["commit", "discard"])
+func fileActionsStillWorkOnTheReviewedDetachedCheckout(_ action: String) async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("file.txt", "Base\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["checkout", "--detach"])
+    try fixture.write("file.txt", "Reviewed content\n")
+    let repository = try await fixture.snapshot()
+    try #require(repository.worktree.isDetached)
+
+    if action == "commit" {
+        let draft = try CommitService.context(for: repository)
+        _ = try CommitService.commit(repository: repository, message: "Save detached edit", expectedFingerprint: draft.fingerprint)
+        #expect(try fixture.git(["show", "HEAD:file.txt"]) == "Reviewed content")
+        #expect(try fixture.git(["log", "-1", "--format=%B"]) == "Save detached edit")
+    } else {
+        let change = try #require(repository.changes.first)
+        _ = try DiscardChanges.discard(repository: repository, change: change)
+        #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+        #expect(try String(contentsOf: fixture.root.appendingPathComponent("file.txt"), encoding: .utf8) == "Base\n")
+    }
+    #expect(try fixture.git(["rev-parse", "refs/heads/main"]) == base)
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+    #expect(GitCommand.run(["-C", fixture.root.path, "symbolic-ref", "--quiet", "HEAD"]).exitCode == 1)
 }

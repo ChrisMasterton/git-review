@@ -13,7 +13,7 @@ It follows the same lightweight SwiftUI approach as Container Review: no third-p
 - Local branches without an upstream, unless their tip is already present on a remote branch.
 - Branch activity context: reliable last-commit age, local reflog-derived last-used age, and an approximate creation age when the original branch-creation reflog entry still exists.
 - Commits behind the current branch's upstream. Repositories whose current branch is behind count as needing attention with a "Behind remote" label.
-- Remote fetch failures, shown without hiding the local status result.
+- Remote fetch failures, kept in Attention without hiding the local status result.
 - One-click cleanup for unpublished local branches and branches whose upstream is gone. Cleanup uses Git's safe delete and skips checked-out or unmerged branches rather than force-deleting work.
 - A commit flow with manual writing or AI generation from compact change summaries, then staging and committing all changes after confirmation.
 - Separate Commit and Push actions, plus a fast-forward-only Pull action for clean working trees.
@@ -35,7 +35,7 @@ Export either `openrouter_api_key` or `OPENROUTER_API_KEY` in your shell configu
 
 The Commit button offers **Write Manually** (no API key or network request) and **Generate with AI**. AI generation sends a redacted prompt capped at 12,000 characters: file paths, added/removed line counts, and selected diff excerpts capped at 1,200 characters per file and 6,000 in total. New, deleted, and untracked file contents are omitted, including unstaged edits to newly staged files. Large file lists and excerpts are explicitly marked as shortened. The generated message remains editable. Requests do not stream and allow 4,096 completion tokens with minimal reasoning; an output-limit error still rejects the incomplete message and points to manual writing.
 
-Full tracked diffs are read and fingerprinted locally, independently of the smaller AI summary. Before staging anything, both manual and AI flows verify that the working change set still matches the draft, protecting against another agent changing the repository during review. Run `scripts/check-commit-flows.sh` for local commit-flow smoke coverage without Swift Testing or OpenRouter credentials.
+Full tracked diffs are read and fingerprinted locally, independently of the smaller AI summary. Before staging anything, both manual and AI flows verify that the working change set still matches the draft, protecting against another agent changing the repository during review. If a hook rejects the commit, the draft remains available for retry after resolving the failure; files edited by a hook or another process still require a new draft. Commit and Discard also recheck the selected branch, so switching branches outside Git Review requires a refresh before acting. Run `scripts/check-commit-flows.sh` for local commit-flow smoke coverage without Swift Testing or OpenRouter credentials.
 
 Push publishes existing commits from the current branch without staging or committing working-tree changes. It uses the existing branch remote when configured and creates an `origin` upstream for a new local branch. A local-only branch listed under Branches Needing Attention can also be published directly without checking it out. Pull is available only for clean working trees and runs with `--ff-only`, so it never creates an implicit merge commit.
 

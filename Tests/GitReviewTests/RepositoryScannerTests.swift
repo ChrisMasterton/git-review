@@ -218,6 +218,49 @@ private final class CommandRecorder: @unchecked Sendable {
     #expect(groups.allSatisfy { $0.worktrees.count == 1 })
 }
 
+@Test @MainActor func failedFetchStaysVisibleInAttentionUntilRemoteRecovers() async throws {
+    let fixture = try GitFixture()
+    let control = try GitFixture()
+    let offline = fixture.directory.appendingPathComponent("offline-origin.git")
+    let base = try fixture.git(["-C", fixture.main.path, "rev-parse", "HEAD"])
+    try FileManager.default.moveItem(at: fixture.remote, to: offline)
+    let suiteName = "git-review-fetch-\(UUID().uuidString)"
+    let defaults = try #require(UserDefaults(suiteName: suiteName))
+    defer { defaults.removePersistentDomain(forName: suiteName) }
+    let store = RepositoryStore(defaults: defaults)
+    store.roots = [fixture.watched, control.watched]
+    store.fetchRemotes = true
+    store.refresh()
+    for _ in 0..<500 {
+        if !store.isRefreshing { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(!store.isRefreshing)
+    let repository = try #require(store.repositories.first { $0.path.path == fixture.main.path })
+    #expect(repository.fetchError != nil)
+    #expect(repository.canAccessCheckout && repository.changes.isEmpty)
+    #expect(repository.branch == "main" && repository.upstream == "origin/main")
+    #expect(repository.unpublishedBranches.isEmpty && repository.behind == 0)
+    #expect(store.fetchWarningCount == 1)
+    #expect(store.visibleRepositories.map(\.id) == [repository.commonDirectory.path])
+    #expect(store.visibleRepositories.first?.statusLabel == "Fetch failed")
+    #expect(store.attentionCount == 1 && store.cleanCount == 1)
+    #expect(store.statusText == "1 of 2 repositories need attention")
+    #expect(try fixture.git(["-C", fixture.main.path, "rev-parse", "HEAD"]) == base)
+
+    try FileManager.default.moveItem(at: offline, to: fixture.remote)
+    store.refresh()
+    for _ in 0..<500 {
+        if !store.isRefreshing { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(!store.isRefreshing)
+    #expect(store.fetchWarningCount == 0 && store.attentionCount == 0)
+    #expect(store.cleanCount == 2 && store.visibleRepositories.isEmpty)
+    #expect(store.statusText == "All 2 repositories are up to date")
+    #expect(try fixture.git(["-C", fixture.main.path, "rev-parse", "HEAD"]) == base)
+}
+
 @Test func refreshClearsAttentionWhenLinkedCheckoutBecomesClean() async throws {
     let fixture = try GitFixture()
     let linked = try fixture.addWorktree("external/linked")

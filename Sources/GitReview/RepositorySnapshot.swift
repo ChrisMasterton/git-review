@@ -75,7 +75,7 @@ struct RepositorySnapshot: Identifiable, Equatable, Sendable {
         return "Up to date"
     }
     var needsAttention: Bool {
-        isUnavailable || worktreeDiscoveryError != nil || statusError != nil || !changes.isEmpty || !unpublishedBranches.isEmpty || behind > 0
+        isUnavailable || worktreeDiscoveryError != nil || statusError != nil || fetchError != nil || !changes.isEmpty || !unpublishedBranches.isEmpty || behind > 0
     }
     var isClean: Bool { !needsAttention }
     var riskRank: Int {
@@ -84,7 +84,7 @@ struct RepositorySnapshot: Identifiable, Equatable, Sendable {
         if !changes.isEmpty && !unpublishedBranches.isEmpty { return 4 }
         if !changes.isEmpty { return 3 }
         if !unpublishedBranches.isEmpty { return 2 }
-        if behind > 0 { return 1 }
+        if behind > 0 || fetchError != nil { return 1 }
         return 0
     }
     var statusLabel: String {
@@ -96,6 +96,7 @@ struct RepositorySnapshot: Identifiable, Equatable, Sendable {
         if !changes.isEmpty { return "Uncommitted" }
         if !unpublishedBranches.isEmpty { return "Needs push" }
         if behind > 0 { return "Behind remote" }
+        if fetchError != nil { return "Fetch failed" }
         return "Up to date"
     }
 }

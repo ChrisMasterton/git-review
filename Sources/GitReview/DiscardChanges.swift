@@ -24,6 +24,7 @@ enum DiscardChanges {
             throw CommitFlowError.command("Open this submodule as a repository to discard its individual files.")
         }
         try CommitService.requireCheckout(repository)
+        _ = try CommitService.currentBranch(for: repository, allowDetached: true)
         let prefix = ["--literal-pathspecs", "-C", repository.path.path]
         let status = GitCommand.run(prefix + ["status", "--porcelain=v2", "-z", "--untracked-files=normal"])
         guard status.exitCode == 0 else { throw CommitFlowError.command(status.error) }
