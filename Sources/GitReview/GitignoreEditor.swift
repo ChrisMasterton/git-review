@@ -34,7 +34,8 @@ struct GitignoreDocument {
             "\\*?[] !#".contains(character) ? "\\" + String(character) : String(character)
         }.joined()
         let rule = "/" + escaped
-        if text.split(separator: "\n").contains(Substring(rule)) { return }
+        // An earlier copy may have been overridden by a later negation.
+        if text.split(whereSeparator: { $0.isNewline }).last == Substring(rule) { return }
         let newline = text.contains("\r\n") ? "\r\n" : "\n"
         if !text.isEmpty && !text.hasSuffix("\n") { text += newline }
         text += rule + newline

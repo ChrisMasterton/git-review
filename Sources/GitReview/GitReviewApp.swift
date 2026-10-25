@@ -7,6 +7,14 @@ struct CommandResult: Sendable {
     let output: String
     let error: String
     let exitCode: Int32
+    let rawOutput: Data
+
+    init(output: String, error: String, exitCode: Int32, rawOutput: Data? = nil) {
+        self.output = output
+        self.error = error
+        self.exitCode = exitCode
+        self.rawOutput = rawOutput ?? Data(output.utf8)
+    }
 }
 
 struct BranchCleanupFailure: Sendable {
@@ -113,19 +121,16 @@ enum CommitService {
             .map { GitStatusParser.removingTrackingSummary(from: String($0)) }
             .joined(separator: "\n")
 
-        let rawContext = """
-        GIT STATUS
-        \(fingerprintStatusOutput)
-
-        STAGED DIFF
-        \(staged.output)
-
-        UNSTAGED DIFF
-        \(unstaged.output)
-        """
-        let untrackedFingerprint = fingerprintForUntrackedFiles(untracked.output, repository: repository)
-        let fingerprintMaterial = rawContext + "\nUNTRACKED CONTENT HASHES\n" + untrackedFingerprint
-        let fingerprint = SHA256.hash(data: Data(fingerprintMaterial.utf8))
+        // Fingerprints need the exact bytes, independently of display decoding
+        // and whitespace trimming. Git diffs may contain non-UTF-8 text.
+        var fingerprintMaterial = Data("GIT STATUS\n\(fingerprintStatusOutput)\n\nSTAGED DIFF\n".utf8)
+        fingerprintMaterial.append(staged.rawOutput)
+        fingerprintMaterial.append(Data("\n\nUNSTAGED DIFF\n".utf8))
+        fingerprintMaterial.append(unstaged.rawOutput)
+        let untrackedPaths = String(decoding: untracked.rawOutput, as: UTF8.self)
+        let untrackedFingerprint = fingerprintForUntrackedFiles(untrackedPaths, repository: repository)
+        fingerprintMaterial.append(Data("\nUNTRACKED CONTENT HASHES\n\(untrackedFingerprint)".utf8))
+        let fingerprint = SHA256.hash(data: fingerprintMaterial)
             .map { String(format: "%02x", $0) }
             .joined()
 
@@ -214,13 +219,12 @@ enum CommitService {
         // After staging, nothing may remain unstaged or untracked. Any leftover
         // worktree-side entry means the repository changed between generating
         // the message and staging it, so refuse to commit unverified content.
-        let residual = GitCommand.run(prefix + ["status", "--porcelain", "--untracked-files=all"])
+        let residual = GitCommand.run(prefix + ["status", "--porcelain=v2", "-z", "--untracked-files=all"])
         guard residual.exitCode == 0 else {
             throw CommitFlowError.command(residual.error.isEmpty ? "Unable to verify staged changes." : residual.error)
         }
-        let hasUnstagedRemainder = residual.output.split(separator: "\n").contains { line in
-            guard line.count > 1 else { return false }
-            return line[line.index(after: line.startIndex)] != " "
+        let hasUnstagedRemainder = GitStatusParser.parse(residual.output).changes.contains {
+            $0.isModified || $0.isUntracked || $0.isConflicted
         }
         guard !hasUnstagedRemainder else { throw CommitFlowError.changedWhileStaging }
 
@@ -324,6 +328,13 @@ enum CommitService {
 
     private static func fileFingerprint(_ url: URL) -> String {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        if attributes?[.type] as? FileAttributeType == .typeSymbolicLink {
+            guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path) else {
+                return "unreadable-symlink"
+            }
+            let digest = SHA256.hash(data: Data(destination.utf8)).map { String(format: "%02x", $0) }.joined()
+            return "symlink:\(digest)"
+        }
         let fileSize = (attributes?[.size] as? NSNumber)?.int64Value ?? -1
         guard let handle = try? FileHandle(forReadingFrom: url) else { return "unreadable" }
         defer { try? handle.close() }

@@ -72,7 +72,8 @@ enum GitCommand {
         }
         process.waitUntilExit()
 
-        let output = (try? String(contentsOf: stdoutURL, encoding: .utf8)) ?? ""
+        let rawOutput = (try? Data(contentsOf: stdoutURL)) ?? Data()
+        let output = String(decoding: rawOutput, as: UTF8.self)
         var error = (try? String(contentsOf: stderrURL, encoding: .utf8)) ?? ""
         if timedOut {
             let note = "Git command exceeded its \(Int(timeout)) second limit and was stopped."
@@ -81,7 +82,8 @@ enum GitCommand {
         return CommandResult(
             output: output.trimmingCharacters(in: .whitespacesAndNewlines),
             error: error.trimmingCharacters(in: .whitespacesAndNewlines),
-            exitCode: process.terminationStatus
+            exitCode: process.terminationStatus,
+            rawOutput: rawOutput
         )
     }
 }

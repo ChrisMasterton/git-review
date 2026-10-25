@@ -47,6 +47,168 @@ private final class CommitFixture {
     }
 }
 
+@Test(arguments: [true, false])
+func nonUTF8TrackedEditsCannotBypassCommitDraftVerification(_ staged: Bool) async throws {
+    let fixture = try CommitFixture()
+    let file = fixture.root.appendingPathComponent("legacy.txt")
+    try Data([0x63, 0x61, 0x66, 0xe9, 0x0a]).write(to: file)
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try Data([0x75, 0x6e, 0xe9, 0x0a]).write(to: file)
+    if staged { try fixture.git(["add", "legacy.txt"]) }
+    let repository = try await fixture.snapshot()
+    let reviewed = try CommitService.context(for: repository)
+    try Data([0x64, 0x65, 0x75, 0x78, 0xe9, 0x0a]).write(to: file)
+    if staged { try fixture.git(["add", "legacy.txt"]) }
+    let indexBlob = try fixture.git(["rev-parse", ":legacy.txt"])
+    let editedBlob = try fixture.git(["hash-object", "--", "legacy.txt"])
+    let changed = try CommitService.context(for: repository)
+
+    #expect(reviewed.fingerprint != changed.fingerprint)
+    #expect(throws: CommitFlowError.self) {
+        try CommitService.commit(repository: repository, message: "Save reviewed edit", expectedFingerprint: reviewed.fingerprint)
+    }
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["rev-parse", ":legacy.txt"]) == indexBlob)
+    #expect(try fixture.git(["hash-object", "--", "legacy.txt"]) == editedBlob)
+
+    // A fresh review must still permit saving the exact non-UTF-8 bytes.
+    let refreshed = try await fixture.snapshot()
+    let fresh = try CommitService.context(for: refreshed)
+    _ = try CommitService.commit(repository: refreshed, message: "Save legacy text", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["rev-parse", "HEAD:legacy.txt"]) == editedBlob)
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+}
+
+@Test func whitespacePrefixedUntrackedEditsCannotBypassCommitDraftVerification() async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    let path = " notes.txt"
+    try fixture.write(path, "Reviewed content\n")
+    let repository = try await fixture.snapshot()
+    #expect(repository.changes.map(\.path) == [path])
+    let reviewed = try CommitService.context(for: repository)
+    try fixture.write(path, "Unreviewed content\n")
+    let editedBlob = try fixture.git(["hash-object", "--", path])
+
+    #expect(try CommitService.context(for: repository).fingerprint != reviewed.fingerprint)
+    #expect(throws: CommitFlowError.self) {
+        try CommitService.commit(repository: repository, message: "Save reviewed notes", expectedFingerprint: reviewed.fingerprint)
+    }
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["diff", "--cached", "--name-only"]).isEmpty)
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent(path), encoding: .utf8) == "Unreviewed content\n")
+
+    let fresh = try CommitService.context(for: repository)
+    _ = try CommitService.commit(repository: repository, message: "Save notes", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["rev-parse", "HEAD:\(path)"]) == editedBlob)
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+}
+
+@Test func untrackedSymlinkVerificationUsesTheSavedDestination() async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("target-a.txt", "Same target content\n")
+    try fixture.write("target-b.txt", "Same target content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    let link = fixture.root.appendingPathComponent("selected-link")
+    try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "target-a.txt")
+    let repository = try await fixture.snapshot()
+    let reviewed = try CommitService.context(for: repository)
+    try FileManager.default.removeItem(at: link)
+    try FileManager.default.createSymbolicLink(atPath: link.path, withDestinationPath: "target-b.txt")
+
+    #expect(try CommitService.context(for: repository).fingerprint != reviewed.fingerprint)
+    #expect(throws: CommitFlowError.self) {
+        try CommitService.commit(repository: repository, message: "Save reviewed link", expectedFingerprint: reviewed.fingerprint)
+    }
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["diff", "--cached", "--name-only"]).isEmpty)
+    #expect(try FileManager.default.destinationOfSymbolicLink(atPath: link.path) == "target-b.txt")
+
+    let fresh = try CommitService.context(for: repository)
+    _ = try CommitService.commit(repository: repository, message: "Save selected link", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["show", "HEAD:selected-link"]) == "target-b.txt")
+    #expect(try fixture.git(["ls-tree", "HEAD", "selected-link"]).hasPrefix("120000 blob "))
+    #expect(try fixture.git(["show", "HEAD:target-a.txt"]) == "Same target content")
+    #expect(try fixture.git(["show", "HEAD:target-b.txt"]) == "Same target content")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+}
+
+@Test func anEditDuringStagingCannotBeHiddenByTrimmedStatusOutput() async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("a-control.txt", "Base control\n")
+    try fixture.write("z-filtered.txt", "Base filtered\n")
+    try fixture.write(".gitattributes", "z-filtered.txt filter=staging-gate\n")
+    let script = fixture.root.appendingPathComponent(".git/slow-clean")
+    let started = fixture.root.appendingPathComponent(".git/add-started")
+    let release = fixture.root.appendingPathComponent(".git/add-release")
+    let armed = fixture.root.appendingPathComponent(".git/staging-gate")
+    try """
+    #!/bin/sh
+    if [ -f .git/staging-gate ]; then
+        case "$(/bin/ps -o command= -p "$PPID")" in
+            *" add --all --"*)
+                touch .git/add-started
+                attempts=0
+                while [ ! -f .git/add-release ] && [ "$attempts" -lt 500 ]; do
+                    sleep 0.02
+                    attempts=$((attempts + 1))
+                done
+                [ -f .git/add-release ] || exit 2
+                ;;
+        esac
+    fi
+    cat
+    """.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    try fixture.git(["config", "filter.staging-gate.clean", script.path])
+    try fixture.git(["config", "filter.staging-gate.required", "true"])
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.write("z-filtered.txt", "Reviewed filtered edit\n")
+    let repository = try await fixture.snapshot()
+    let reviewed = try CommitService.context(for: repository)
+    try Data().write(to: armed)
+    defer { try? Data().write(to: release) }
+    // The real clean filter pauses only git add, after the earlier path was
+    // inspected. Status and diff remain free to verify the submitted draft.
+    let operation = Task.detached {
+        try CommitService.commit(repository: repository, message: "Save reviewed edit", expectedFingerprint: reviewed.fingerprint)
+    }
+    for _ in 0..<500 {
+        if FileManager.default.fileExists(atPath: started.path) { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(FileManager.default.fileExists(atPath: started.path))
+    try fixture.write("a-control.txt", "New edit during staging\n")
+    try Data().write(to: release)
+    var rejected = false
+    do { _ = try await operation.value }
+    catch CommitFlowError.changedWhileStaging { rejected = true }
+    #expect(rejected)
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["show", ":a-control.txt"]) == "Base control")
+    #expect(try fixture.git(["show", ":z-filtered.txt"]) == "Reviewed filtered edit")
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent("a-control.txt"), encoding: .utf8) == "New edit during staging\n")
+
+    try FileManager.default.removeItem(at: armed)
+    let fresh = try CommitService.context(for: repository)
+    _ = try CommitService.commit(repository: repository, message: "Save both reviewed edits", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["show", "HEAD:a-control.txt"]) == "New edit during staging")
+    #expect(try fixture.git(["show", "HEAD:z-filtered.txt"]) == "Reviewed filtered edit")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+}
+
 @Test(arguments: ["simple", "matching"])
 func currentBranchPushTargetsOnlyItsConfiguredUpstream(_ pushDefault: String) async throws {
     let fixture = try CommitFixture()
