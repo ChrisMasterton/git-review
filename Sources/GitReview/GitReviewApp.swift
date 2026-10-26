@@ -62,6 +62,7 @@ struct CommitDraft: Sendable {
 enum CommitFlowError: LocalizedError {
     case noAPIKey
     case noChanges
+    case unresolvedConflicts
     case changedSinceGeneration
     case changedWhileStaging
     case commitRejected(String, retryFingerprint: String)
@@ -74,6 +75,8 @@ enum CommitFlowError: LocalizedError {
             return "OpenRouter API key not found in the app environment or your login shell. Export openrouter_api_key or OPENROUTER_API_KEY in your shell configuration (for example, ~/.zshrc), then try again."
         case .noChanges:
             return "No pending changes were found to commit."
+        case .unresolvedConflicts:
+            return "Resolve and stage all conflicted files before committing. Nothing was staged or committed."
         case .changedSinceGeneration:
             return "The repository changed after the commit draft was opened. Nothing was staged or committed. Refresh and open a new commit draft."
         case .changedWhileStaging:
@@ -201,6 +204,15 @@ enum CommitService {
     }
 
     static func commit(repository: RepositorySnapshot, message: String, expectedFingerprint: String) throws -> String {
+        let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
+        let status = GitCommand.run(prefix + ["status", "--porcelain=v2", "-z", "--untracked-files=all"])
+        guard status.exitCode == 0 else { throw CommitFlowError.command(status.error) }
+        let changes = GitStatusParser.parse(status.output).changes
+        guard !changes.contains(where: \.isConflicted) else { throw CommitFlowError.unresolvedConflicts }
+        let reviewedPaths = workingTreePaths(changes)
+        // Capture content before checking the draft, so an edit between this
+        // read and draft verification cannot become an approved staging result.
+        let reviewedContents = try workingTreeContents(reviewedPaths, repository: repository)
         let currentContext = try context(for: repository)
         guard currentContext.fingerprint == expectedFingerprint else {
             throw CommitFlowError.changedSinceGeneration
@@ -210,7 +222,6 @@ enum CommitService {
             throw CommitFlowError.invalidResponse("Enter a commit message before committing.")
         }
 
-        let prefix = ["-C", repository.path.path, "-c", "core.quotePath=false"]
         let add = GitCommand.run(prefix + ["add", "--all", "--"])
         guard add.exitCode == 0 else {
             throw CommitFlowError.command(add.error.isEmpty ? "Unable to stage repository changes." : add.error)
@@ -223,10 +234,17 @@ enum CommitService {
         guard residual.exitCode == 0 else {
             throw CommitFlowError.command(residual.error.isEmpty ? "Unable to verify staged changes." : residual.error)
         }
-        let hasUnstagedRemainder = GitStatusParser.parse(residual.output).changes.contains {
+        let stagedChanges = GitStatusParser.parse(residual.output).changes
+        let hasUnstagedRemainder = stagedChanges.contains {
             $0.isModified || $0.isUntracked || $0.isConflicted
         }
         guard !hasUnstagedRemainder else { throw CommitFlowError.changedWhileStaging }
+        // An edit that add picks up leaves no unstaged remainder. Check the
+        // contents too, independently of their staged/unstaged status codes.
+        guard workingTreePaths(stagedChanges).isSubset(of: reviewedPaths),
+              try workingTreeContents(reviewedPaths, repository: repository) == reviewedContents else {
+            throw CommitFlowError.changedWhileStaging
+        }
 
         // Staging changes the fingerprint even when the submitted files did not
         // change. Retain this state for retries, before hooks can edit anything.
@@ -321,12 +339,42 @@ enum CommitService {
         }.joined(separator: "\n")
     }
 
+    private static func workingTreePaths(_ changes: [GitFileChange]) -> Set<String> {
+        Set(changes.flatMap { [$0.path] + ($0.originalPath.map { [$0] } ?? []) }.map {
+            $0.hasSuffix("/") ? String($0.dropLast()) : $0
+        })
+    }
+
+    private static func workingTreeContents(_ paths: Set<String>, repository: RepositorySnapshot) throws -> [String: String] {
+        var contents: [String: String] = [:]
+        for path in paths.sorted() {
+            let url = repository.path.appendingPathComponent(path)
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+            if attributes?[.type] as? FileAttributeType == .typeDirectory {
+                // Git stores a nested repository's commit, not its directory bytes.
+                let top = GitCommand.run(["-C", url.path, "rev-parse", "--show-toplevel"])
+                let head = GitCommand.run(["-C", url.path, "rev-parse", "--verify", "HEAD"])
+                guard top.exitCode == 0, head.exitCode == 0,
+                      GitPath.canonical(URL(fileURLWithPath: top.output)) == GitPath.canonical(url) else {
+                    throw CommitFlowError.command("Unable to verify the nested repository at \(path) before committing.")
+                }
+                contents[path] = "gitlink:\(head.output)"
+            } else {
+                let executable = ((attributes?[.posixPermissions] as? NSNumber)?.intValue ?? 0) & 0o111 != 0
+                // Full reads are limited to commit confirmation. Draft generation
+                // keeps its bounded sampling of large untracked files.
+                contents[path] = "\(executable):\(fileFingerprint(url, fullContents: true))"
+            }
+        }
+        return contents
+    }
+
     /// Caps how much of an untracked file is hashed. Huge untracked artifacts
     /// must not slow message generation, while the file size plus both ends
     /// still detect appends, truncation, and edits near either end of the file.
     private static let fingerprintedFileSpan = 512 * 1024
 
-    private static func fileFingerprint(_ url: URL) -> String {
+    private static func fileFingerprint(_ url: URL, fullContents: Bool = false) -> String {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         if attributes?[.type] as? FileAttributeType == .typeSymbolicLink {
             guard let destination = try? FileManager.default.destinationOfSymbolicLink(atPath: url.path) else {
@@ -341,7 +389,7 @@ enum CommitService {
         var hasher = SHA256()
         hasher.update(data: Data("\(fileSize)".utf8))
         do {
-            if fileSize < 0 || fileSize <= Int64(fingerprintedFileSpan) {
+            if fullContents || fileSize < 0 || fileSize <= Int64(fingerprintedFileSpan) {
                 while let chunk = try handle.read(upToCount: 1_048_576), !chunk.isEmpty {
                     hasher.update(data: chunk)
                 }
@@ -625,6 +673,10 @@ final class RepositoryStore: ObservableObject {
 
     func requestCommit(_ repository: RepositorySnapshot) {
         guard !isDiscardingChanges, !isRemovingWorktree, worktreeToRemove == nil else { return }
+        guard repository.conflictCount == 0 else {
+            commitFlowError = CommitFlowError.unresolvedConflicts.localizedDescription
+            return
+        }
         guard !repository.changes.isEmpty else {
             commitFlowError = CommitFlowError.noChanges.localizedDescription
             return
@@ -1353,7 +1405,8 @@ struct DetailHeader: View {
                     Label("Commit", systemImage: "checkmark.circle")
                 }
                 .fixedSize(horizontal: true, vertical: false)
-                .disabled(!repository.canAccessCheckout || repository.changes.isEmpty || store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling || store.isRemovingWorktree)
+                .help(repository.conflictCount > 0 ? "Resolve and stage conflicted files before committing" : "Write or generate a message, then stage and commit all changes")
+                .disabled(!repository.canAccessCheckout || repository.conflictCount > 0 || repository.changes.isEmpty || store.isGeneratingCommit || store.isCommitting || store.isPushing || store.isPulling || store.isRemovingWorktree)
                 Button { store.push(repository) } label: {
                     Label("Push", systemImage: "arrow.up.circle")
                 }

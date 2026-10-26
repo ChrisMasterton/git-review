@@ -209,6 +209,106 @@ func nonUTF8TrackedEditsCannotBypassCommitDraftVerification(_ staged: Bool) asyn
     #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
 }
 
+@Test func anEditPickedUpDuringStagingCannotBeCommittedWithoutReview() async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.write("a-filtered.txt", "Base filtered\n")
+    try fixture.write("z-edited.txt", "Base edited\n")
+    try fixture.write(".gitattributes", "a-filtered.txt filter=staging-gate\n")
+    let script = fixture.root.appendingPathComponent(".git/slow-clean")
+    let started = fixture.root.appendingPathComponent(".git/add-started")
+    let release = fixture.root.appendingPathComponent(".git/add-release")
+    let armed = fixture.root.appendingPathComponent(".git/staging-gate")
+    try """
+    #!/bin/sh
+    if [ -f .git/staging-gate ]; then
+        case "$(/bin/ps -o command= -p "$PPID")" in
+            *" add --all --"*)
+                touch .git/add-started
+                attempts=0
+                while [ ! -f .git/add-release ] && [ "$attempts" -lt 500 ]; do
+                    sleep 0.02
+                    attempts=$((attempts + 1))
+                done
+                [ -f .git/add-release ] || exit 2
+                ;;
+        esac
+    fi
+    cat
+    """.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    try fixture.git(["config", "filter.staging-gate.clean", script.path])
+    try fixture.git(["config", "filter.staging-gate.required", "true"])
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.write("a-filtered.txt", "Reviewed filtered edit\n")
+    try fixture.write("z-edited.txt", "Reviewed later edit\n")
+    let repository = try await fixture.snapshot()
+    let reviewed = try CommitService.context(for: repository)
+    try Data().write(to: armed)
+    defer { try? Data().write(to: release) }
+    let operation = Task.detached {
+        try CommitService.commit(repository: repository, message: "Save reviewed edits", expectedFingerprint: reviewed.fingerprint)
+    }
+    for _ in 0..<500 {
+        if FileManager.default.fileExists(atPath: started.path) { break }
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    try #require(FileManager.default.fileExists(atPath: started.path))
+    // This edit arrives before git add reads the later file, so no unstaged
+    // remainder is left to reveal that unreviewed content was picked up.
+    try fixture.write("z-edited.txt", "Unreviewed edit during staging\n")
+    try Data().write(to: release)
+    var rejected = false
+    do { _ = try await operation.value }
+    catch CommitFlowError.changedWhileStaging { rejected = true }
+    #expect(rejected)
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["show", ":z-edited.txt"]) == "Unreviewed edit during staging")
+    #expect(try fixture.git(["diff", "--name-only"]).isEmpty)
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+
+    try FileManager.default.removeItem(at: armed)
+    let fresh = try CommitService.context(for: repository)
+    _ = try CommitService.commit(repository: repository, message: "Save newly reviewed edits", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["show", "HEAD:z-edited.txt"]) == "Unreviewed edit during staging")
+    #expect(try fixture.git(["show", "HEAD:a-filtered.txt"]) == "Reviewed filtered edit")
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+}
+
+@Test func stagingVerificationPreservesRenamesDeletionsModesLinksAndSubmodules() async throws {
+    let fixture = try CommitFixture()
+    try fixture.git(["config", "core.filemode", "true"])
+    try fixture.write("old.txt", "Rename this file\n")
+    try fixture.write("delete.txt", "Delete this file\n")
+    try fixture.write("script.sh", "#!/bin/sh\nexit 0\n")
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["-c", "protocol.file.allow=always", "submodule", "add", fixture.root.path, "nested"])
+    try fixture.git(["mv", "old.txt", "renamed.txt"])
+    try FileManager.default.removeItem(at: fixture.root.appendingPathComponent("delete.txt"))
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: fixture.root.appendingPathComponent("script.sh").path)
+    try FileManager.default.createSymbolicLink(atPath: fixture.root.appendingPathComponent("link").path, withDestinationPath: "renamed.txt")
+    let repository = try await fixture.snapshot()
+    let reviewed = try CommitService.context(for: repository)
+
+    _ = try CommitService.commit(repository: repository, message: "Save mixed file changes", expectedFingerprint: reviewed.fingerprint)
+
+    #expect(try fixture.git(["show", "HEAD:renamed.txt"]) == "Rename this file")
+    #expect(try fixture.git(["ls-tree", "HEAD", "old.txt", "delete.txt"]).isEmpty)
+    #expect(try fixture.git(["ls-tree", "HEAD", "script.sh"]).hasPrefix("100755 blob "))
+    #expect(try fixture.git(["ls-tree", "HEAD", "link"]).hasPrefix("120000 blob "))
+    #expect(try fixture.git(["show", "HEAD:link"]) == "renamed.txt")
+    #expect(try fixture.git(["ls-tree", "HEAD", "nested"]) == "160000 commit \(base)\tnested")
+    #expect(try fixture.git(["-C", fixture.root.appendingPathComponent("nested").path, "rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+}
+
 @Test(arguments: ["simple", "matching"])
 func currentBranchPushTargetsOnlyItsConfiguredUpstream(_ pushDefault: String) async throws {
     let fixture = try CommitFixture()
@@ -239,6 +339,52 @@ func currentBranchPushTargetsOnlyItsConfiguredUpstream(_ pushDefault: String) as
     let refreshed = try await fixture.snapshot()
     #expect(refreshed.currentBranchTracking?.ahead == 0)
     #expect(refreshed.branches.first { $0.name == "control" }?.canPublish == true)
+}
+
+@Test @MainActor func commitAllCannotResolveUnmergedFilesBySavingConflictMarkers() async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("file.txt", "Base\n")
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    try fixture.git(["checkout", "-b", "feature"])
+    try fixture.write("file.txt", "Feature change\n")
+    try fixture.git(["commit", "-am", "Feature"])
+    let feature = try fixture.git(["rev-parse", "HEAD"])
+    try fixture.git(["checkout", "main"])
+    try fixture.write("file.txt", "Main change\n")
+    try fixture.git(["commit", "-am", "Main"])
+    let main = try fixture.git(["rev-parse", "HEAD"])
+    let merge = GitCommand.run(["-C", fixture.root.path, "merge", "feature"])
+    try #require(merge.exitCode == 1)
+    let repository = try await fixture.snapshot()
+    try #require(repository.conflictCount == 1)
+    let unmergedIndex = try fixture.git(["ls-files", "--unmerged"])
+    let conflictText = try String(contentsOf: fixture.root.appendingPathComponent("file.txt"), encoding: .utf8)
+    let reviewed = try CommitService.context(for: repository)
+    let store = RepositoryStore()
+    store.requestCommit(repository)
+    #expect(store.commitConsentRepository == nil)
+    #expect(store.commitFlowError == CommitFlowError.unresolvedConflicts.localizedDescription)
+
+    #expect(throws: CommitFlowError.self) {
+        try CommitService.commit(repository: repository, message: "Complete merge", expectedFingerprint: reviewed.fingerprint)
+    }
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == main)
+    #expect(try fixture.git(["ls-files", "--unmerged"]) == unmergedIndex)
+    #expect(try String(contentsOf: fixture.root.appendingPathComponent("file.txt"), encoding: .utf8) == conflictText)
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+
+    // A deliberately resolved and staged merge still uses the normal commit flow.
+    try fixture.write("file.txt", "Resolved change\n")
+    try fixture.git(["add", "file.txt"])
+    let resolved = try await fixture.snapshot()
+    let fresh = try CommitService.context(for: resolved)
+    _ = try CommitService.commit(repository: resolved, message: "Complete resolved merge", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["show", "HEAD:file.txt"]) == "Resolved change")
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+    #expect(try fixture.git(["log", "-1", "--format=%P"]) == "\(main) \(feature)")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
 }
 
 @Test(arguments: [true, false])
