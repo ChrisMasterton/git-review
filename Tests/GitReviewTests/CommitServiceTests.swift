@@ -28,8 +28,10 @@ private final class CommitFixture {
     }
 }
 
-@Test func commitPromptOmitsStagedNewFileContentsAndKeepsLocalFingerprint() async throws {
+@Test(arguments: [false, true])
+func commitPromptOmitsStagedNewFileContentsAndKeepsLocalFingerprint(_ mnemonicPrefixes: Bool) async throws {
     let fixture = try CommitFixture()
+    try fixture.git(["config", "diff.mnemonicPrefix", mnemonicPrefixes ? "true" : "false"])
     try fixture.write("NewFeature.swift", String(repeating: "newFileContentMustStayLocal\n", count: 4000))
     try fixture.git(["add", "--all"])
     // Includes an unstaged change to the same staged addition.
@@ -45,6 +47,67 @@ private final class CommitFixture {
     #expect(throws: CommitFlowError.self) {
         try CommitService.commit(repository: repository, message: "Add feature", expectedFingerprint: before.fingerprint)
     }
+}
+
+@Test func untrackedExecutableModeChangesRequireANewCommitDraft() async throws {
+    let fixture = try CommitFixture()
+    try fixture.git(["config", "core.filemode", "true"])
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    let script = fixture.root.appendingPathComponent("script.sh")
+    try fixture.write("script.sh", "#!/bin/sh\nexit 0\n")
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: script.path)
+    let repository = try await fixture.snapshot()
+    let reviewed = try CommitService.context(for: repository)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+
+    #expect(try CommitService.context(for: repository).fingerprint != reviewed.fingerprint)
+    #expect(throws: CommitFlowError.self) {
+        try CommitService.commit(repository: repository, message: "Add reviewed script", expectedFingerprint: reviewed.fingerprint)
+    }
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["diff", "--cached", "--name-only"]).isEmpty)
+    #expect(try String(contentsOf: script, encoding: .utf8) == "#!/bin/sh\nexit 0\n")
+
+    let fresh = try CommitService.context(for: repository)
+    _ = try CommitService.commit(repository: repository, message: "Add executable script", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["ls-tree", "HEAD", "script.sh"]).hasPrefix("100755 blob "))
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
+}
+
+@Test func untrackedNestedRepositoryCommitsRequireANewCommitDraft() async throws {
+    let fixture = try CommitFixture()
+    try fixture.write("control.txt", "Keep this content\n")
+    try fixture.git(["add", "--all"])
+    try fixture.git(["commit", "-m", "Base"])
+    let base = try fixture.git(["rev-parse", "HEAD"])
+    let nested = fixture.root.appendingPathComponent("nested")
+    try fixture.git(["init", "--initial-branch=main", nested.path])
+    try fixture.git(["-C", nested.path, "config", "user.name", "Fixture"])
+    try fixture.git(["-C", nested.path, "config", "user.email", "fixture@example.invalid"])
+    try fixture.git(["-C", nested.path, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Reviewed nested commit"])
+    let repository = try await fixture.snapshot()
+    #expect(repository.changes.map(\.path) == ["nested/"])
+    let reviewed = try CommitService.context(for: repository)
+    try fixture.git(["-C", nested.path, "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "--allow-empty", "-m", "Later nested commit"])
+    let nestedTip = try fixture.git(["-C", nested.path, "rev-parse", "HEAD"])
+
+    #expect(try CommitService.context(for: repository).fingerprint != reviewed.fingerprint)
+    #expect(throws: CommitFlowError.self) {
+        try CommitService.commit(repository: repository, message: "Add reviewed nested repository", expectedFingerprint: reviewed.fingerprint)
+    }
+    #expect(try fixture.git(["rev-parse", "HEAD"]) == base)
+    #expect(try fixture.git(["diff", "--cached", "--name-only"]).isEmpty)
+    #expect(try fixture.git(["-C", nested.path, "rev-parse", "HEAD"]) == nestedTip)
+
+    let fresh = try CommitService.context(for: repository)
+    _ = try CommitService.commit(repository: repository, message: "Add nested repository", expectedFingerprint: fresh.fingerprint)
+    #expect(try fixture.git(["ls-tree", "HEAD", "nested"]) == "160000 commit \(nestedTip)\tnested")
+    #expect(try fixture.git(["show", "HEAD:control.txt"]) == "Keep this content")
+    #expect(try fixture.git(["status", "--porcelain"]).isEmpty)
 }
 
 @Test(arguments: [true, false])

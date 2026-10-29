@@ -112,8 +112,11 @@ enum CommitService {
         let statusLines = status.output.split(separator: "\n")
         guard statusLines.contains(where: { !$0.hasPrefix("## ") }) else { throw CommitFlowError.noChanges }
 
-        let staged = GitCommand.run(prefix + ["diff", "--cached", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "--"])
-        let unstaged = GitCommand.run(prefix + ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--unified=3", "--"])
+        // Match files across staged and unstaged diffs even when the user's
+        // mnemonic prefixes would otherwise change c/i into i/w.
+        let diffOptions = ["--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--unified=3", "--"]
+        let staged = GitCommand.run(prefix + ["diff", "--cached"] + diffOptions)
+        let unstaged = GitCommand.run(prefix + ["diff"] + diffOptions)
         let untracked = GitCommand.run(prefix + ["ls-files", "--others", "--exclude-standard", "-z"])
 
         for result in [staged, unstaged, untracked] where result.exitCode != 0 {
@@ -131,7 +134,7 @@ enum CommitService {
         fingerprintMaterial.append(Data("\n\nUNSTAGED DIFF\n".utf8))
         fingerprintMaterial.append(unstaged.rawOutput)
         let untrackedPaths = String(decoding: untracked.rawOutput, as: UTF8.self)
-        let untrackedFingerprint = fingerprintForUntrackedFiles(untrackedPaths, repository: repository)
+        let untrackedFingerprint = try fingerprintForUntrackedFiles(untrackedPaths, repository: repository)
         fingerprintMaterial.append(Data("\nUNTRACKED CONTENT HASHES\n\(untrackedFingerprint)".utf8))
         let fingerprint = SHA256.hash(data: fingerprintMaterial)
             .map { String(format: "%02x", $0) }
@@ -332,11 +335,10 @@ enum CommitService {
         }
     }
 
-    private static func fingerprintForUntrackedFiles(_ output: String, repository: RepositorySnapshot) -> String {
-        output.split(separator: "\0").map(String.init).sorted().map { path in
-            let url = repository.path.appendingPathComponent(path)
-            return "\(path)\t\(fileFingerprint(url))"
-        }.joined(separator: "\n")
+    private static func fingerprintForUntrackedFiles(_ output: String, repository: RepositorySnapshot) throws -> String {
+        let paths = Set(output.split(separator: "\0").map(String.init))
+        let contents = try workingTreeContents(paths, repository: repository, fullContents: false)
+        return contents.sorted { $0.key < $1.key }.map { "\($0.key)\t\($0.value)" }.joined(separator: "\n")
     }
 
     private static func workingTreePaths(_ changes: [GitFileChange]) -> Set<String> {
@@ -345,7 +347,9 @@ enum CommitService {
         })
     }
 
-    private static func workingTreeContents(_ paths: Set<String>, repository: RepositorySnapshot) throws -> [String: String] {
+    private static func workingTreeContents(
+        _ paths: Set<String>, repository: RepositorySnapshot, fullContents: Bool = true
+    ) throws -> [String: String] {
         var contents: [String: String] = [:]
         for path in paths.sorted() {
             let url = repository.path.appendingPathComponent(path)
@@ -363,7 +367,7 @@ enum CommitService {
                 let executable = ((attributes?[.posixPermissions] as? NSNumber)?.intValue ?? 0) & 0o111 != 0
                 // Full reads are limited to commit confirmation. Draft generation
                 // keeps its bounded sampling of large untracked files.
-                contents[path] = "\(executable):\(fileFingerprint(url, fullContents: true))"
+                contents[path] = "\(executable):\(fileFingerprint(url, fullContents: fullContents))"
             }
         }
         return contents
